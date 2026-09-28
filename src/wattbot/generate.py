@@ -2,13 +2,18 @@
 
 import csv
 import json
+import logging
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
+from langchain_core.exceptions import OutputParserException
+from pydantic import BaseModel, Field, ValidationError
 
 from wattbot.models import ROOT, get_mimo, image_block
 from wattbot.retrieve import retrieve
+
+
+logger = logging.getLogger(__name__)
 
 
 # 字段沿用已有比赛输出，answer_unit 和引用网址由程序处理，不让模型猜测。
@@ -57,9 +62,19 @@ Rules:
 """
 
 
+def blank_answer(reason):
+    """局部失败时明确拒答，并在 explanation 中保留失败原因。"""
+    # 不编造答案、引用或支持材料；失败回退与模型主动拒答可通过说明区分。
+    return {
+        "answer": "is_blank", "answer_value": "is_blank", "ref_ids": [],
+        "supporting_materials": "is_blank", "explanation": reason,
+    }
+
+
 def generate_answer(question: str, answer_unit: str, evidence):
     """将正文、完整表格和原图组成多模态消息，返回答案字典。"""
     # 保留缺少单位时的既有规则，不把无单位的分类题误判为不可回答。
+    answer_unit = answer_unit or ""
     unit_hint = (
         "No unit; answer_value must still contain the answer."
         if not answer_unit.strip() or answer_unit.strip().lower() == "is_blank"
@@ -87,7 +102,14 @@ def generate_answer(question: str, answer_unit: str, evidence):
         # 紧跟证据标签附上对应图像，让模型能把图片与论文引用匹配起来。
         for path in record["image_paths"]:
             if path not in attached_images:
-                content.append(image_block(path))
+                block = image_block(path)
+                if block is None:
+                    content.append({
+                        "type": "text",
+                        "text": "The image attachment is unavailable. Use only the supplied text; do not infer visual values.",
+                    })
+                    continue
+                content.append(block)
                 attached_images.add(path)
 
     # JSON mode 不会自动将字段类型发给模型，显式附上与解析器相同的 schema。
@@ -99,27 +121,40 @@ def generate_answer(question: str, answer_unit: str, evidence):
 
     # 一道题统一调用 MiMo，返回结果仍由 Pydantic 严格检查字段类型。
     model = get_mimo().with_structured_output(AnswerDraft, method="json_mode")
-    return model.invoke(messages).model_dump()
+    try:
+        return model.invoke(messages).model_dump()
+    except (OutputParserException, ValidationError):
+        # 只处理模型输出格式异常；网络、鉴权、额度等 API 错误继续向外抛出。
+        logger.warning("模型答案不符合结构，当前题回退为 is_blank：%s", question)
+        return blank_answer("Generation fallback: the model output did not match the required answer schema.")
 
 
 def answer_one(row, metadata_by_id):
     """完成一道题的检索、生成、引用整理和比赛字段归一化。"""
     # 先取回原始证据，再调用生成模型；检索描述不会替代原图。
     evidence = retrieve(row["question"])
-    draft = generate_answer(row["question"], row.get("answer_unit", ""), evidence)
+    if evidence:
+        draft = generate_answer(row["question"], row.get("answer_unit", ""), evidence)
+    else:
+        logger.warning("%s 没有可用检索证据，回退为 is_blank", row["id"])
+        draft = blank_answer("Retrieval fallback: no usable evidence remained for this question.")
 
     # 引用必须来自本题证据且存在于官方元数据；网址只从元数据中读取。
     available_ids = {record["ref_id"] for record in evidence}
     ref_ids = list(dict.fromkeys(
         ref_id for ref_id in draft["ref_ids"]
-        if ref_id in available_ids and ref_id in metadata_by_id
+        if ref_id in available_ids and (metadata_by_id.get(ref_id, {}).get("url") or "").strip()
     ))
+    if set(draft["ref_ids"]) - set(ref_ids):
+        logger.warning("%s 已移除未检索到或缺少元数据网址的引用", row["id"])
     answer_value = str(draft["answer_value"]).strip()
     is_blank = answer_value.lower() == "is_blank"
 
-    # 保留拒答规范；明显不完整的模型结果直接报错，不伪装成有效比赛答案。
+    # 局部答案不完整时显式拒答，不中断整批，也不伪装成有效答案。
     if not draft["explanation"].strip():
-        raise ValueError(f"{row['id']} 缺少 explanation")
+        logger.warning("%s 缺少 explanation，回退为 is_blank", row["id"])
+        draft = blank_answer("Generation fallback: the answer was missing an explanation.")
+        is_blank = True
     if not is_blank and (
         not answer_value
         or not ref_ids
@@ -128,7 +163,9 @@ def answer_one(row, metadata_by_id):
         or not draft["supporting_materials"].strip()
         or draft["supporting_materials"].strip().lower() == "is_blank"
     ):
-        raise ValueError(f"{row['id']} 的答案或支持证据不完整")
+        logger.warning("%s 的答案或支持证据不完整，回退为 is_blank", row["id"])
+        draft = blank_answer("Generation fallback: the answer, supporting material or valid citations were incomplete.")
+        is_blank = True
     if is_blank:
         ref_ids = []
         answer_value = "is_blank"
@@ -152,7 +189,7 @@ def answer_one(row, metadata_by_id):
 
 
 def predict_all(input_path=None, output_path=None):
-    """逐题预测并写出 CSV；默认输出新文件，不覆盖原先的文本 baseline。"""
+    """逐题预测并写出 CSV；局部失败拒答，系统级失败保留已有输出文件。"""
     # 所有默认路径相对项目根目录；可指定其他问题文件用于后续小范围运行。
     input_path = Path(input_path) if input_path else ROOT / "input/test_Q.csv"
     output_path = (

@@ -1,6 +1,7 @@
 """使用 Docling 解析文本、表格和图片，将检索文本与原始证据一起交给索引。"""
 
 import json
+import logging
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,6 +16,9 @@ from langchain_core.messages import HumanMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from wattbot.models import ARTIFACTS_DIR, EMBEDDING_MODEL, ROOT, get_mimo, image_block
+
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -49,13 +53,19 @@ def save_item_images(item, doc, output_dir):
     paths = []
     name = item.self_ref.removeprefix("#/").replace("/", "_")
     for number in range(max(1, len(item.prov))):
-        image = DocItem.get_image(item, doc, prov_index=number)
-        if image is None:
-            image = item.get_image(doc, prov_index=number)
+        try:
+            image = DocItem.get_image(item, doc, prov_index=number)
+            if image is None:
+                image = item.get_image(doc, prov_index=number)
+        except (ValueError, IndexError, KeyError, TypeError) as exc:
+            logger.warning("元素截图失败，跳过该来源区域 %s[%d]：%s", name, number, exc)
+            continue
         if image is not None:
             path = output_dir / f"{name}_{number}.png"
             image.save(path)
             paths.append(path.relative_to(ROOT).as_posix())
+        else:
+            logger.warning("元素没有可导出的图片：%s[%d]", name, number)
     return paths
 
 
@@ -64,7 +74,13 @@ def describe_picture(image_paths, caption):
     # 不再做哈希缓存；论文、提示词或模型变更后需清理对应描述再建库。
     cache_path = (ROOT / image_paths[0]).with_suffix(".txt")
     if cache_path.exists():
-        return cache_path.read_text(encoding="utf-8")
+        try:
+            cached = cache_path.read_text(encoding="utf-8").strip()
+            if cached:
+                return cached
+            logger.warning("图片描述缓存为空，重新生成：%s", cache_path)
+        except (OSError, UnicodeError) as exc:
+            logger.warning("图片描述缓存不可读，重新生成：%s（%s）", cache_path, exc)
 
     # 图题与原图一起提供给 MiMo，要求保留检索关键词而不猜测数字。
     content = [{
@@ -78,11 +94,20 @@ def describe_picture(image_paths, caption):
             f"Original caption: {caption}"
         ),
     }]
-    content.extend(image_block(path) for path in image_paths)
+    images = [block for path in image_paths if (block := image_block(path)) is not None]
+    if not images:
+        logger.warning("图片均不可读，使用图题作为检索文本：%s", image_paths)
+        return caption
+    content.extend(images)
+    # API、鉴权和模型配置异常不捕获；空描述是单张图片的局部问题。
     description = get_mimo().invoke([HumanMessage(content=content)]).text.strip()
     if not description:
-        raise ValueError(f"图片描述为空：{image_paths}")
-    cache_path.write_text(description, encoding="utf-8")
+        logger.warning("图片描述为空，回退到图题：%s", image_paths)
+        return caption
+    try:
+        cache_path.write_text(description, encoding="utf-8")
+    except OSError as exc:
+        logger.warning("描述缓存写入失败，继续使用本次描述：%s（%s）", cache_path, exc)
     return description
 
 
@@ -99,39 +124,81 @@ def make_document(text, ref_id, source_id, modality, items, content, image_paths
     })
 
 
+def get_caption(item, doc):
+    """图题或表题损坏时返回空文本，不影响同篇论文的其他元素。"""
+    # 仅捕获元素引用或内容错误，不处理模型和 API 异常。
+    try:
+        return item.caption_text(doc)
+    except (ValueError, IndexError, KeyError, TypeError) as exc:
+        logger.warning("元素标题读取失败，忽略标题 %s：%s", item.self_ref, exc)
+        return ""
+
+
+def get_text_chunks(doc, chunker, splitter, tables):
+    """优先结构化分块；局部结构损坏时按已提取元素做普通文本分块。"""
+    # HybridChunker 内部会一次处理全文；单表异常可能导致整个迭代无法产生结果。
+    try:
+        chunks = list(chunker.chunk(dl_doc=doc))
+    except (ValueError, IndexError, KeyError, TypeError) as exc:
+        logger.warning("结构化分块失败，回退到逐元素文本分块：%s", exc)
+        for item in [*doc.texts, *doc.tables]:
+            text = (tables[item.self_ref][0] or get_caption(item, doc)
+                    if isinstance(item, TableItem) else item.text)
+            for part in splitter.split_text(text):
+                yield part, [item]
+        return
+
+    # 单块上下文异常时仍可使用块内原文，不丢掉后续正常块。
+    for chunk in chunks:
+        try:
+            text = chunker.contextualize(chunk=chunk)
+        except (ValueError, IndexError, KeyError, TypeError) as exc:
+            logger.warning("块上下文生成失败，回退到块内原文：%s", exc)
+            text = chunk.text
+        yield text.strip(), chunk.meta.doc_items
+
+
 def ingest_pdf(pdf_path):
     """解析一篇论文，返回正文、表格和图片描述组成的检索记录。"""
-    # 一篇 PDF 只转换一次；解析失败时停止，不把不完整内容当作成功。
+    # 一篇 PDF 只转换一次；局部解析失败时保留可用结果，整篇失败仍停止。
     pdf_path = Path(pdf_path)
     ref_id = pdf_path.stem
     result = get_converter().convert(pdf_path)
-    if result.status != ConversionStatus.SUCCESS:
-        raise RuntimeError(f"Docling 未完整解析 {pdf_path.name}：{result.status}")
+    if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
+        raise RuntimeError(f"Docling 无法解析 {pdf_path.name}：{result.status}")
+    if result.status == ConversionStatus.PARTIAL_SUCCESS:
+        logger.warning("PDF 仅部分解析成功，继续处理可用内容：%s", pdf_path.name)
     doc = result.document
     output_dir = ARTIFACTS_DIR / ref_id
     output_dir.mkdir(parents=True, exist_ok=True)
     documents = []
 
     # 完整表格只导出一次，之后让它的各个检索块带上相同的原始内容。
-    tables = {
-        table.self_ref: (
-            table.export_to_markdown(doc=doc),
-            save_item_images(table, doc, output_dir),
-        )
-        for table in doc.tables
-    }
+    tables = {}
+    for table in doc.tables:
+        try:
+            content = table.export_to_markdown(doc=doc)
+        except (ValueError, IndexError, KeyError, TypeError) as exc:
+            logger.warning("表格导出失败，回退到截图或检索块 %s %s：%s",
+                           ref_id, table.self_ref, exc)
+            content = ""
+        tables[table.self_ref] = (content, save_item_images(table, doc, output_dir))
 
     # 正文和表格按结构分块；图片由后面的描述流程单独处理。
     chunker = get_chunker()
-    for number, chunk in enumerate(chunker.chunk(dl_doc=doc)):
-        items = chunk.meta.doc_items
-        text = chunker.contextualize(chunk=chunk).strip()
+    splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
+        chunker.tokenizer.get_tokenizer(), chunk_size=400, chunk_overlap=40
+    )
+    for number, (text, items) in enumerate(get_text_chunks(doc, chunker, splitter, tables)):
         if not text or any(isinstance(item, PictureItem) for item in items):
             continue
         table_items = {item.self_ref: item for item in items if isinstance(item, TableItem)}
         if len(table_items) == 1:
             source_id, table = next(iter(table_items.items()))
-            content, images = tables[source_id]
+            content, images = tables.get(source_id, ("", []))
+            if not content.strip():
+                logger.warning("完整表格为空，保留当前表格块：%s %s", ref_id, source_id)
+                content = text
             documents.append(make_document(
                 text, ref_id, source_id, "table", [table], content, images
             ))
@@ -141,15 +208,15 @@ def ingest_pdf(pdf_path):
             ))
 
     # 过长的图题和描述按 token 切分，但所有块仍关联同一份原图。
-    splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
-        chunker.tokenizer.get_tokenizer(), chunk_size=400, chunk_overlap=40
-    )
     for picture in doc.pictures:
         images = save_item_images(picture, doc, output_dir)
+        caption = get_caption(picture, doc)
         if not images:
-            raise ValueError(f"无法导出图片：{ref_id} {picture.self_ref}")
-        caption = picture.caption_text(doc)
-        description = describe_picture(images, caption)
+            logger.warning("无法导出图片，尝试仅保留图题：%s %s", ref_id, picture.self_ref)
+        description = describe_picture(images, caption) if images else ""
+        if not (caption + description).strip():
+            logger.warning("图片无可用检索文字，跳过：%s %s", ref_id, picture.self_ref)
+            continue
         for text in splitter.split_text(f"{caption}\n{description}"):
             documents.append(make_document(
                 text, ref_id, picture.self_ref, "image", [picture], caption, images
