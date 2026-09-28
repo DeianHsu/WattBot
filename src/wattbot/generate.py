@@ -7,7 +7,7 @@ from pathlib import Path
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.exceptions import OutputParserException
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from wattbot.models import ROOT, get_mimo, image_block
 from wattbot.retrieve import retrieve
@@ -18,13 +18,50 @@ logger = logging.getLogger(__name__)
 
 # 字段沿用已有比赛输出，answer_unit 和引用网址由程序处理，不让模型猜测。
 class AnswerDraft(BaseModel):
-    """约束模型答案的字段类型，供 LangChain 解析 JSON 响应。"""
+    """保留核心答案约束，辅助字段局部异常不使整份答案解析失败。"""
 
-    answer: str = Field(min_length=1)
+    answer: str = ""
     answer_value: str | int | float
-    ref_ids: list[str]
-    supporting_materials: str = Field(min_length=1)
-    explanation: str = Field(min_length=1)
+    ref_ids: list[str] = Field(default_factory=list)
+    supporting_materials: str = ""
+    explanation: str = ""
+
+    @field_validator("answer", "supporting_materials", "explanation", mode="before")
+    @classmethod
+    def normalize_text(cls, value, info):
+        """只整理已有文字的表示形式，不补造证据或推理。"""
+        # 列表按行连接，字典保留为 JSON 文本；缺失值交给提交层单独降级。
+        if isinstance(value, str):
+            return value.strip()
+        logger.warning("%s 格式异常，仅整理该字段，保留 answer_value", info.field_name)
+        if isinstance(value, list):
+            return "\n".join(
+                item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+                for item in value if item is not None
+            )
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        return ""
+
+    @field_validator("ref_ids", mode="before")
+    @classmethod
+    def normalize_ref_ids(cls, value):
+        """整理引用列表；真实来源及网址仍由提交层核验。"""
+        # 接受单个 ID 或字符串化的列表，不把任意对象伪装成引用。
+        if isinstance(value, str):
+            logger.warning("ref_ids 不是列表，尝试整理引用，保留 answer_value")
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = [value]
+            if isinstance(value, str):
+                value = [value]
+        if not isinstance(value, list):
+            logger.warning("ref_ids 格式不可用，清空引用，保留 answer_value")
+            return []
+        if any(not isinstance(item, str) for item in value):
+            logger.warning("ref_ids 含非字符串项，跳过异常项，保留 answer_value")
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
 # 使用英文提示词匹配英文问题；文档内容只能作为证据，不能覆盖系统规则。
@@ -42,6 +79,13 @@ Rules:
 1. answer is a readable answer. answer_value is the actual answer for scoring:
    a number without units, a name/category, or "1"/"0" for true/false.
    Convert numerical values into the expected unit when one is supplied.
+   For a derived or chart-read range where any value within the band is acceptable,
+   use the STRING "[low, high]", for example "[10, 12]".
+   When both endpoints of a source-stated range or all reported values are required,
+   use the STRING "(a, b)", for example "(0.18, 3.1)". Include every required value.
+   In CrossPaper/Reconcile questions, do not replace two distinct required values
+   with an interval, a midpoint, or just one source's value.
+   These formats must be JSON strings, NOT JSON arrays; keep units outside them.
 2. A missing expected unit does not make the question unanswerable.
 3. ref_ids is a list of paper IDs explicitly present in the evidence.
    Cite only sources directly supporting the answer, including all sources
@@ -119,7 +163,7 @@ def generate_answer(question: str, answer_unit: str, evidence):
         HumanMessage(content=content),
     ]
 
-    # 一道题统一调用 MiMo，返回结果仍由 Pydantic 严格检查字段类型。
+    # 一道题统一调用 MiMo；辅助字段单独整理，核心答案仍由 Pydantic 检查。
     model = get_mimo().with_structured_output(AnswerDraft, method="json_mode")
     try:
         return model.invoke(messages).model_dump()
@@ -148,27 +192,26 @@ def answer_one(row, metadata_by_id):
     if set(draft["ref_ids"]) - set(ref_ids):
         logger.warning("%s 已移除未检索到或缺少元数据网址的引用", row["id"])
     answer_value = str(draft["answer_value"]).strip()
-    is_blank = answer_value.lower() == "is_blank"
+    is_blank = not answer_value or answer_value.lower() == "is_blank"
 
-    # 局部答案不完整时显式拒答，不中断整批，也不伪装成有效答案。
-    if not draft["explanation"].strip():
-        logger.warning("%s 缺少 explanation，回退为 is_blank", row["id"])
-        draft = blank_answer("Generation fallback: the answer was missing an explanation.")
-        is_blank = True
-    if not is_blank and (
-        not answer_value
-        or not ref_ids
-        or not draft["answer"].strip()
-        or draft["answer"].strip().lower() == "is_blank"
-        or not draft["supporting_materials"].strip()
-        or draft["supporting_materials"].strip().lower() == "is_blank"
-    ):
-        logger.warning("%s 的答案或支持证据不完整，回退为 is_blank", row["id"])
-        draft = blank_answer("Generation fallback: the answer, supporting material or valid citations were incomplete.")
-        is_blank = True
+    # 只有核心答案缺失或明确拒答时才清空整题，不因辅助字段缺陷改写答案值。
     if is_blank:
         ref_ids = []
         answer_value = "is_blank"
+    else:
+        if not ref_ids:
+            logger.warning("%s 无有效引用，仅清空引用字段，保留 answer_value", row["id"])
+        if not draft["answer"].strip() or draft["answer"].strip().lower() == "is_blank":
+            logger.warning("%s 缺少可读答案，使用 answer_value 作为 answer", row["id"])
+            draft["answer"] = answer_value
+        if not draft["supporting_materials"].strip() or draft["supporting_materials"].strip().lower() == "is_blank":
+            logger.warning("%s 缺少 supporting_materials，仅将该字段置为 is_blank", row["id"])
+            draft["supporting_materials"] = "is_blank"
+
+    # 说明缺失时明确标记缺失，不把占位说明包装成有效推理或正确性证明。
+    if not draft["explanation"].strip() or draft["explanation"].strip().lower() == "is_blank":
+        logger.warning("%s 缺少 explanation，填入缺失说明，不改写 answer_value", row["id"])
+        draft["explanation"] = "The model did not provide an explanation; no reasoning has been reconstructed."
 
     # 保留输入里的 id、question、answer_unit 和 Cohort 等字段，只覆盖答案列。
     submission_row = dict(row)
@@ -189,7 +232,7 @@ def answer_one(row, metadata_by_id):
 
 
 def predict_all(input_path=None, output_path=None):
-    """逐题预测并写出 CSV；局部失败拒答，系统级失败保留已有输出文件。"""
+    """逐题预测并写出 CSV；辅助字段局部降级，系统级失败保留已有输出文件。"""
     # 所有默认路径相对项目根目录；可指定其他问题文件用于后续小范围运行。
     input_path = Path(input_path) if input_path else ROOT / "input/test_Q.csv"
     output_path = (

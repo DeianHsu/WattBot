@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 from langchain_core.documents import Document
 from langchain_core.exceptions import OutputParserException
+from langchain_core.output_parsers import PydanticOutputParser
 
 
 # 直接执行测试时使用项目源码，不依赖重新安装包。
@@ -97,15 +98,62 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 generate.generate_answer("q", "", [])
 
-    def test_invalid_citation_becomes_explicit_blank(self):
-        """无合法引用时清空提交引用，并说明是生成回退。"""
+    def test_invalid_citation_preserves_answer_value(self):
+        """无合法引用时只清空提交引用，不抹掉已有答案和文字。"""
         draft = {"answer": "42", "answer_value": 42, "ref_ids": ["invented"],
                  "supporting_materials": "quote", "explanation": "reason"}
         with patch.object(generate, "retrieve", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft), self.assertLogs(generate.logger):
             row = generate.answer_one({"id": "q1", "question": "q"}, {})
-            for key in ("answer", "answer_value", "ref_id", "ref_url", "supporting_materials"):
+            for key in ("ref_id", "ref_url"):
                 self.assertEqual(row[key], "is_blank")
-            self.assertIn("fallback", row["explanation"])
+            self.assertEqual(row["answer_value"], "42")
+            self.assertEqual(row["answer"], "42")
+            self.assertEqual(row["supporting_materials"], "quote")
+            self.assertEqual(row["explanation"], "reason")
+
+    def test_auxiliary_fields_do_not_break_structured_parser(self):
+        """辅助字段缺失、空值或错类型时，真实解析器仍保留核心答案。"""
+        parser = PydanticOutputParser(pydantic_object=generate.AnswerDraft)
+        variants = [
+            {},
+            {"ref_ids": None, "supporting_materials": None, "explanation": None},
+            {"ref_ids": "paper", "supporting_materials": ["quote 1", "quote 2"], "explanation": ["reason"]},
+            {"ref_ids": {"invalid": "paper"}, "supporting_materials": {"quote": "original"}, "explanation": 123},
+        ]
+        for auxiliary in variants:
+            with self.subTest(auxiliary=auxiliary):
+                draft = parser.parse(json.dumps({"answer_value": 42, **auxiliary}))
+                with patch.object(generate, "retrieve", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft.model_dump()), self.assertLogs(generate.logger):
+                    row = generate.answer_one({"id": "q", "question": "q"}, {"paper": {"url": "https://example.com"}})
+                self.assertEqual(row["answer_value"], "42")
+                self.assertTrue(row["explanation"])
+        self.assertEqual(parser.parse('{"answer_value": 42, "supporting_materials": ["a", "b"]}').supporting_materials, "a\nb")
+
+    def test_explicit_abstention_still_clears_evidence(self):
+        """核心答案明确拒答时继续遵守比赛的联动清空规则。"""
+        draft = generate.AnswerDraft(answer_value="is_blank", answer="unanswerable", ref_ids=["paper"], supporting_materials="quote", explanation="Insufficient evidence.")
+        with patch.object(generate, "retrieve", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft.model_dump()):
+            row = generate.answer_one({"id": "q", "question": "q"}, {"paper": {"url": "https://example.com"}})
+        for field in ("answer", "answer_value", "ref_id", "ref_url", "supporting_materials"):
+            self.assertEqual(row[field], "is_blank")
+
+    def test_missing_core_answer_still_fails_parsing(self):
+        """仅放宽辅助字段；缺少核心答案仍不能当成有效响应。"""
+        parser = PydanticOutputParser(pydantic_object=generate.AnswerDraft)
+        with self.assertRaises(OutputParserException):
+            parser.parse('{"explanation": "no answer"}')
+
+    def test_range_and_pair_strings_preserved(self):
+        """区间与必需数值对保持不同括号，辅助字段降级不改变它们。"""
+        parser = PydanticOutputParser(pydantic_object=generate.AnswerDraft)
+        self.assertIn('[low, high]', generate.SYSTEM_PROMPT)
+        self.assertIn('(a, b)', generate.SYSTEM_PROMPT)
+        for value in ("[10, 12]", "(0.18, 3.1)"):
+            with self.subTest(value=value):
+                draft = parser.parse(json.dumps({"answer_value": value}))
+                with patch.object(generate, "retrieve", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft.model_dump()), self.assertLogs(generate.logger):
+                    row = generate.answer_one({"id": "q", "question": "q"}, {})
+                self.assertEqual(row["answer_value"], value)
 
     def test_chunking_failure_uses_extracted_text(self):
         """结构化分块损坏后保留已解析的正文。"""
