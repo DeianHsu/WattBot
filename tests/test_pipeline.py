@@ -210,6 +210,24 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(all(block["type"] == "text" for block in content))
             self.assertTrue(any("unavailable" in block["text"] for block in content))
 
+    def test_picture_description_reuses_exact_duplicates(self):
+        """精确重复图片只生成一次描述，但返回每个图片元素的结果。"""
+        jobs = [
+            (SimpleNamespace(), ["first.png"], "same caption"),
+            (SimpleNamespace(), ["second.png"], "same caption"),
+            (SimpleNamespace(), ["third.png"], "other caption"),
+        ]
+        with patch.object(ingest, "inspect_picture", side_effect=[((1, "same"), False), ((1, "same"), False), ((2, "other"), False)]), patch.object(ingest, "read_description_cache", return_value=None), patch.object(ingest, "describe_picture", side_effect=["same description", "other description"]):
+            descriptions = ingest.describe_pictures(jobs, "paper")
+        self.assertEqual(descriptions, ["same description", "same description", "other description"])
+
+    def test_blank_picture_skips_remote_description(self):
+        """完全空白图片只保留图题，不调用远程描述。"""
+        jobs = [(SimpleNamespace(), ["blank.png"], "blank caption")]
+        with patch.object(ingest, "inspect_picture", return_value=((1, "blank"), True)), patch.object(ingest, "describe_picture") as describe:
+            self.assertEqual(ingest.describe_pictures(jobs, "paper"), ["blank caption"])
+            describe.assert_not_called()
+
     def test_batch_continues_after_local_failure(self):
         """首题格式失败后仍生成次题，并完整写出两行 CSV。"""
         valid = generate.AnswerDraft(answer="42", answer_value=42, ref_ids=["paper"], supporting_materials="quote", explanation="reason")

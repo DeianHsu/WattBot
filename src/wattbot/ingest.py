@@ -2,8 +2,13 @@
 
 import json
 import logging
+import hashlib
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from functools import lru_cache
 from pathlib import Path
+from time import perf_counter
+
+from PIL import Image, UnidentifiedImageError
 
 from docling.chunking import HybridChunker
 from docling.datamodel.base_models import ConversionStatus, InputFormat
@@ -19,6 +24,7 @@ from wattbot.models import ARTIFACTS_DIR, EMBEDDING_MODEL, ROOT, get_mimo, image
 
 
 logger = logging.getLogger(__name__)
+PICTURE_WORKERS = 3
 
 
 @lru_cache(maxsize=1)
@@ -69,9 +75,11 @@ def save_item_images(item, doc, output_dir):
     return paths
 
 
-def describe_picture(image_paths, caption):
-    """生成图片检索描述，固定论文下复用同名文本文件。"""
-    # 不再做哈希缓存；论文、提示词或模型变更后需清理对应描述再建库。
+def read_description_cache(image_paths):
+    """读取已有描述；空缓存或坏缓存返回空值，留给生成流程处理。"""
+    # 仍按原来的图片文件名找缓存，不迁移或删除用户已有产物。
+    if not image_paths:
+        return None
     cache_path = (ROOT / image_paths[0]).with_suffix(".txt")
     if cache_path.exists():
         try:
@@ -81,6 +89,18 @@ def describe_picture(image_paths, caption):
             logger.warning("图片描述缓存为空，重新生成：%s", cache_path)
         except (OSError, UnicodeError) as exc:
             logger.warning("图片描述缓存不可读，重新生成：%s（%s）", cache_path, exc)
+    return None
+
+
+def describe_picture(image_paths, caption):
+    """生成图片检索描述，固定论文下复用同名文本文件。"""
+    # 先用同名缓存；内容变更后的缓存失效仍由用户显式处理。
+    cached = read_description_cache(image_paths)
+    if cached:
+        return cached
+    if not image_paths:
+        return caption
+    cache_path = (ROOT / image_paths[0]).with_suffix(".txt")
 
     # 图题与原图一起提供给 MiMo，要求保留检索关键词而不猜测数字。
     content = [{
@@ -109,6 +129,94 @@ def describe_picture(image_paths, caption):
     except OSError as exc:
         logger.warning("描述缓存写入失败，继续使用本次描述：%s（%s）", cache_path, exc)
     return description
+
+
+def inspect_picture(image_paths):
+    """仅识别完全空白图和精确重复像素，不用尺寸或相似度猜测图片价值。"""
+    # 白图或全透明图没有独立视觉信息；黑色、彩色图例色块仍保留。
+    signatures = []
+    all_blank = bool(image_paths)
+    for path in image_paths:
+        try:
+            with Image.open(ROOT / path) as image:
+                rgba = image.convert("RGBA")
+                white = Image.new("RGBA", rgba.size, "white")
+                visible = Image.alpha_composite(white, rgba).convert("RGB")
+                all_blank = all_blank and all(low == high == 255 for low, high in visible.getextrema())
+                signatures.append((rgba.size, hashlib.sha256(rgba.tobytes()).hexdigest()))
+        except (FileNotFoundError, UnidentifiedImageError) as exc:
+            # 无法确认像素相同就不合并；缺图由原有描述流程降级。
+            logger.warning("图片筛选检查失败，不自动过滤 %s：%s", path, exc)
+            return None, False
+    return tuple(signatures), all_blank
+
+
+def describe_pictures(jobs, ref_id):
+    """图片去重、复用缓存并受控并发描述；按输入顺序返回结果。"""
+    # 各图片只共享描述，不合并 evidence_id、来源页码或原始附件。
+    started = perf_counter()
+    descriptions = [""] * len(jobs)
+    groups = {}
+    filtered = 0
+    for number, (_, images, caption) in enumerate(jobs):
+        signature, blank = inspect_picture(images)
+        if not images or blank:
+            descriptions[number] = caption
+            filtered += 1
+            print(f"[{ref_id}] 图片 {number + 1}：无可用图像或完全空白，仅保留图题", flush=True)
+            continue
+        key = (signature, caption) if signature is not None else (number, caption)
+        groups.setdefault(key, []).append(number)
+
+    # 同组任意成员的有效缓存都可复用；未命中缓存的独立图片才进入线程池。
+    pending_jobs = []
+    cached_count = 0
+    duplicate_count = sum(len(numbers) - 1 for numbers in groups.values())
+    for numbers in groups.values():
+        cached = next((value for number in numbers
+                       if (value := read_description_cache(jobs[number][1]))), None)
+        if cached:
+            for number in numbers:
+                descriptions[number] = cached
+            cached_count += len(numbers)
+        else:
+            pending_jobs.append(numbers)
+    completed = filtered + cached_count
+    print(f"[{ref_id}] 图片描述：{completed}/{len(jobs)}；空白/缺图 {filtered}，"
+          f"缓存覆盖 {cached_count}，精确重复 {duplicate_count}，"
+          f"待生成 {len(pending_jobs)} 组，并发 {PICTURE_WORKERS}", flush=True)
+
+    # 最多提交三个在途任务；一旦系统异常，不再调度后续图片。
+    iterator = iter(pending_jobs)
+    pool = ThreadPoolExecutor(max_workers=PICTURE_WORKERS)
+    pending = {}
+    try:
+        for _ in range(min(PICTURE_WORKERS, len(pending_jobs))):
+            numbers = next(iterator)
+            _, images, caption = jobs[numbers[0]]
+            pending[pool.submit(describe_picture, images, caption)] = numbers
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                numbers = pending.pop(future)
+                description = future.result()
+                for number in numbers:
+                    descriptions[number] = description
+                completed += len(numbers)
+                print(f"[{ref_id}] 图片描述：{completed}/{len(jobs)}，"
+                      f"本组生成/回退完成，已用 {perf_counter() - started:.1f}s", flush=True)
+            for _ in done:
+                numbers = next(iterator, None)
+                if numbers is None:
+                    break
+                _, images, caption = jobs[numbers[0]]
+                pending[pool.submit(describe_picture, images, caption)] = numbers
+    finally:
+        # 已发送的请求无法撤销，等待在途任务结束；系统异常原样向上抛出。
+        pool.shutdown(wait=True, cancel_futures=True)
+    print(f"[{ref_id}] 图片描述完成：{len(jobs)}/{len(jobs)}，"
+          f"耗时 {perf_counter() - started:.1f}s", flush=True)
+    return descriptions
 
 
 def make_document(text, ref_id, source_id, modality, items, content, image_paths=None):
@@ -163,17 +271,23 @@ def ingest_pdf(pdf_path):
     # 一篇 PDF 只转换一次；局部解析失败时保留可用结果，整篇失败仍停止。
     pdf_path = Path(pdf_path)
     ref_id = pdf_path.stem
+    stage_started = perf_counter()
+    print(f"[{ref_id}] 开始 Docling 解析（含 OCR、版面和表格识别）", flush=True)
     result = get_converter().convert(pdf_path)
     if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
         raise RuntimeError(f"Docling 无法解析 {pdf_path.name}：{result.status}")
     if result.status == ConversionStatus.PARTIAL_SUCCESS:
         logger.warning("PDF 仅部分解析成功，继续处理可用内容：%s", pdf_path.name)
     doc = result.document
+    print(f"[{ref_id}] Docling 解析完成，耗时 {perf_counter() - stage_started:.1f}s，"
+          f"{len(doc.tables)} 张表格、{len(doc.pictures)} 个图片元素", flush=True)
     output_dir = ARTIFACTS_DIR / ref_id
     output_dir.mkdir(parents=True, exist_ok=True)
     documents = []
 
     # 完整表格只导出一次，之后让它的各个检索块带上相同的原始内容。
+    stage_started = perf_counter()
+    print(f"[{ref_id}] 开始正文/表格分块与表格截图导出", flush=True)
     tables = {}
     for table in doc.tables:
         try:
@@ -207,13 +321,25 @@ def ingest_pdf(pdf_path):
                 text, ref_id, f"text:{number}", "text", items, text
             ))
 
-    # 过长的图题和描述按 token 切分，但所有块仍关联同一份原图。
+    print(f"[{ref_id}] 正文/表格处理完成：{len(documents)} 个块，"
+          f"耗时 {perf_counter() - stage_started:.1f}s", flush=True)
+
+    # Docling 元素截图串行导出，仅远程描述调用并发，避免共享解析器状态。
+    stage_started = perf_counter()
+    print(f"[{ref_id}] 开始图片导出", flush=True)
+    jobs = []
     for picture in doc.pictures:
         images = save_item_images(picture, doc, output_dir)
         caption = get_caption(picture, doc)
         if not images:
             logger.warning("无法导出图片，尝试仅保留图题：%s %s", ref_id, picture.self_ref)
-        description = describe_picture(images, caption) if images else ""
+        jobs.append((picture, images, caption))
+    print(f"[{ref_id}] 图片导出完成：{len(jobs)} 个元素，"
+          f"耗时 {perf_counter() - stage_started:.1f}s", flush=True)
+
+    # 完成顺序可以不同，但检索块始终按原始图片顺序生成。
+    descriptions = describe_pictures(jobs, ref_id)
+    for (picture, images, caption), description in zip(jobs, descriptions):
         if not (caption + description).strip():
             logger.warning("图片无可用检索文字，跳过：%s %s", ref_id, picture.self_ref)
             continue
