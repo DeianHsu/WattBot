@@ -1,6 +1,8 @@
+# 忽略密钥、本地模型数据、论文以及可重新生成的解析产物。
 .env
 .venv/
 chroma_db/
 __pycache__/
 /papers/
 /.idea/
+/artifacts/

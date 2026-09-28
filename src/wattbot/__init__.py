@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from wattbot!")
+"""WattBot 多模态 RAG 包；导入包本身不加载模型、不运行任务。"""

@@ -1,12 +1,15 @@
+# 项目依赖与命令行入口；模型加载和外部请求只在业务命令执行时发生。
 [project]
 name = "wattbot"
 version = "0.1.0"
-description = "Add your description here"
+description = "基于 Docling、LangChain 和 MiMo 的 WattBot 多模态 RAG"
 authors = [
     { name = "DeianHsu", email = "663781679@qq.com" }
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "docling>=2.130.0",
+    "docling-core[chunking]",
     "langchain-chroma>=1.1.0",
     "langchain-classic>=1.0.8",
     "langchain-community>=0.4.2",
@@ -20,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-wattbot = "wattbot:main"
+wattbot = "wattbot.main:main"
 
 [build-system]
 requires = ["uv_build>=0.12.2,<0.13.0"]
