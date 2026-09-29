@@ -15,7 +15,7 @@ from docling.datamodel.base_models import ConversionStatus, InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
-from docling_core.types.doc import DocItem, PictureItem, TableItem
+from docling_core.types.doc import ContentLayer, DocItem, PictureItem, TableItem
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -324,11 +324,17 @@ def ingest_pdf(pdf_path):
     print(f"[{ref_id}] 正文/表格处理完成：{len(documents)} 个块，"
           f"耗时 {perf_counter() - stage_started:.1f}s", flush=True)
 
-    # Docling 元素截图串行导出，仅远程描述调用并发，避免共享解析器状态。
+    # 只处理 Docling 判定为正文的图片；页眉页脚等非正文图片不导出、不描述。
+    body_pictures = [picture for picture in doc.pictures
+                     if picture.content_layer == ContentLayer.BODY]
+    print(f"[{ref_id}] 正文图片 {len(body_pictures)}/{len(doc.pictures)}；"
+          f"过滤非正文图片 {len(doc.pictures) - len(body_pictures)} 个", flush=True)
+
+    # 正文图片串行导出，仅远程描述调用并发，避免共享解析器状态。
     stage_started = perf_counter()
     print(f"[{ref_id}] 开始图片导出", flush=True)
     jobs = []
-    for picture in doc.pictures:
+    for picture in body_pictures:
         images = save_item_images(picture, doc, output_dir)
         caption = get_caption(picture, doc)
         if not images:

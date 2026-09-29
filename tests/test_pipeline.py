@@ -170,6 +170,7 @@ class PipelineTests(unittest.TestCase):
         """部分解析成功、无截图且无图题时，仍保留正文。"""
         picture = Mock()
         picture.self_ref = "#/pictures/0"
+        picture.content_layer = ingest.ContentLayer.BODY
         picture.caption_text.return_value = ""
         item = SimpleNamespace(prov=[SimpleNamespace(page_no=1)])
         result = SimpleNamespace(status=ingest.ConversionStatus.PARTIAL_SUCCESS,
@@ -177,6 +178,30 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(ingest, "ARTIFACTS_DIR", Path(directory)), patch.object(ingest, "get_converter") as converter, patch.object(ingest, "get_chunker"), patch.object(ingest.RecursiveCharacterTextSplitter, "from_huggingface_tokenizer"), patch.object(ingest, "get_text_chunks", return_value=[("text", [item])]), patch.object(ingest, "save_item_images", return_value=[]), self.assertLogs(ingest.logger):
             converter.return_value.convert.return_value = result
             self.assertEqual(len(ingest.ingest_pdf("paper.pdf")), 1)
+
+    def test_only_body_pictures_are_exported_and_described(self):
+        """非正文图片不导出、不调用描述；无图题的正文图片仍保留。"""
+        pictures = [
+            SimpleNamespace(self_ref="#/pictures/0", content_layer=ingest.ContentLayer.BODY,
+                            prov=[SimpleNamespace(page_no=1)], caption_text=Mock(return_value="Figure 1")),
+            SimpleNamespace(self_ref="#/pictures/1", content_layer=ingest.ContentLayer.BODY,
+                            prov=[SimpleNamespace(page_no=2)], caption_text=Mock(return_value="")),
+            SimpleNamespace(self_ref="#/pictures/2", content_layer=ingest.ContentLayer.FURNITURE,
+                            prov=[SimpleNamespace(page_no=2)], caption_text=Mock(return_value="logo")),
+            SimpleNamespace(self_ref="#/pictures/3", content_layer=ingest.ContentLayer.BACKGROUND,
+                            prov=[SimpleNamespace(page_no=2)], caption_text=Mock(return_value="")),
+        ]
+        doc = SimpleNamespace(tables=[], pictures=pictures)
+        result = SimpleNamespace(status=ingest.ConversionStatus.SUCCESS, document=doc)
+        text_item = SimpleNamespace(prov=[SimpleNamespace(page_no=1)])
+        with tempfile.TemporaryDirectory() as directory, patch.object(ingest, "ARTIFACTS_DIR", Path(directory)), patch.object(ingest, "get_converter") as converter, patch.object(ingest, "get_chunker"), patch.object(ingest.RecursiveCharacterTextSplitter, "from_huggingface_tokenizer") as splitter_factory, patch.object(ingest, "get_text_chunks", return_value=[("text", [text_item])]), patch.object(ingest, "save_item_images", return_value=["body.png"]) as export, patch.object(ingest, "describe_pictures", return_value=["first", "second"]) as describe:
+            converter.return_value.convert.return_value = result
+            splitter_factory.return_value.split_text.side_effect = lambda text: [text]
+            records = ingest.ingest_pdf("paper.pdf")
+        self.assertEqual(export.call_count, 2)
+        self.assertEqual([job[0].self_ref for job in describe.call_args.args[0]],
+                         ["#/pictures/0", "#/pictures/1"])
+        self.assertEqual(sum(record.metadata["modality"] == "image" for record in records), 2)
 
     def test_whole_pdf_failure_still_raises(self):
         """整篇 PDF 失败不可用空结果冒充成功。"""
