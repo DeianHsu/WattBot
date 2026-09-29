@@ -30,8 +30,9 @@ PICTURE_WORKERS = 3
 @lru_cache(maxsize=1)
 def get_converter():
     """复用 Docling 转换器，同时保留表格结构和页面图像。"""
-    # 页面图像供 Docling 按来源位置导出表格和图片。
+    # 固定论文集有原生文字层，关闭 OCR；页面图像仍供表格和图片导出。
     options = PdfPipelineOptions()
+    options.do_ocr = False
     options.do_table_structure = True
     options.generate_page_images = True
     options.generate_picture_images = True
@@ -272,7 +273,7 @@ def ingest_pdf(pdf_path):
     pdf_path = Path(pdf_path)
     ref_id = pdf_path.stem
     stage_started = perf_counter()
-    print(f"[{ref_id}] 开始 Docling 解析（含 OCR、版面和表格识别）", flush=True)
+    print(f"[{ref_id}] 开始 Docling 解析（OCR 关闭，保留版面和表格识别）", flush=True)
     result = get_converter().convert(pdf_path)
     if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
         raise RuntimeError(f"Docling 无法解析 {pdf_path.name}：{result.status}")
