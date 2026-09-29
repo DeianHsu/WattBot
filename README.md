@@ -12,15 +12,19 @@ PDF → Docling
              ↓
      BGE embedding → Chroma
              ↓
-     召回 20 条 → 重排全部候选 → 按 evidence_id 去重 → 最多取 5 份原始证据
+     问题 → MiMo 列出最少必需事实（单事实题保留原问题）
+              ↓
+     每项事实：向量 60 条 + 关键词 60 条 → 重排 → 原始证据
+              ↓
+     各路轮流合并 → 按 evidence_id 去重 → 最多取 10 份原始证据
              ↓
      取回原始证据 → MiMo → 提交 CSV
 ```
 
 - `ingest.py`：统一解析、分块、保存图片、生成图片描述。
 - `index.py`：按论文建库；重新处理一篇论文时直接替换它的记录。
-- `retrieve.py`：召回、重排、证据去重。
-- `generate.py`：多模态回答、引用及拒答处理、CSV 输出。
+- `retrieve.py`：逐项复用向量和全文索引召回、重排，再合并证据。
+- `generate.py`：事实规划、多模态回答、引用及拒答处理、CSV 输出。
 - `models.py`：共用模型和路径。
 - `main.py`：建库、预测入口。
 
@@ -47,6 +51,16 @@ uv run python src/wattbot/main.py build-index --pdf "papers/实际论文文件�
 uv run python src/wattbot/main.py predict
 ```
 
+需要比较改动前后的训练题效果时，先生成固定的 40 题开发集，再分别保存预测和评分：
+
+```powershell
+uv run python scripts/make_dev_questions.py
+uv run python src/wattbot/main.py predict --input artifacts/dev_questions.csv --output artifacts/dev_baseline.csv
+uv run python -m wattbot.evaluate input/train_QA.csv artifacts/dev_baseline.csv
+```
+
+开发集只把题目和单位传给模型；标准答案仅用于评分。40 题刻意覆盖少见题型，分数不能直接等同于 Kaggle 公开榜分数。每次改动使用相同输入、不同输出文件对照。
+
 也可用 predict 的 --input 和 --output 指定问题文件和输出路径。安装项目后，uv run wattbot 可以调用同一入口。
 
 ## 约定与注意事项
@@ -55,13 +69,13 @@ uv run python src/wattbot/main.py predict
 - 输入为 input/test_Q.csv 和 input/metadata.csv；输出为 submissions/test_submission.csv。
 - 所有答案生成成功后一次写出 CSV；不保存中间结果，中断后需要重新预测。
 - 图片描述使用同名 .txt 缓存，不再计算哈希。默认论文不变；修改论文、描述提示词或模型后，需要清理对应描述文件再建库。
-- 首次建库可能下载模型。图片描述及问答会调用 MiMo，正文和表格解析不调用 MiMo。
+- 首次建库可能下载模型。图片描述、问题事实规划及问答会调用 MiMo，正文和表格解析不调用 MiMo。
 - 模型对象保留缓存，避免每道题重新加载 embedding 或 reranker。
 - 使用 wattbot_multimodal_v2 collection，旧的纯文本 wattbot collection 不变。按论文替换索引时，写入失败可能留下该论文的部分记录，需要重新建这篇论文。
 - 本次改变了 metadata 格式，若已经运行过上一版多模态建库，必须重新完成全部论文的建库后再预测；旧 evidence.json 不再使用，本次没有删除任何已生成的数据。
 - 已用两篇论文的四页完成小样测试；补全 JSON Schema 后，四道题均通过结构化解析、答案数值对照和批量 CSV 写出。该结果不代表全量准确率，完整测试集尚未运行。
 - 依赖声明已有更新，但本次没有安装依赖或更新 uv.lock；后续 uv sync 会同步锁文件。
-- 当前仍是基于图片描述检索的多模态 RAG，不是视觉向量检索。计算、跨论文比较和拒答由提示词约束，不含独立计算工具。
+- 当前仍是基于图片描述检索的多模态 RAG，不是视觉向量检索。跨论文题按必需事实分别检索；计算和拒答仍由提示词约束，不含独立计算工具。
 
 ## 建库耗时与图片处理
 
@@ -74,14 +88,15 @@ uv run python src/wattbot/main.py predict
 
 ## 局部异常处理
 
-- 重排保留全部 20 条候选，按 evidence_id 去重后最多取 5 份证据；不足 5 份时使用实际数量，不重复填充。
+- 每项事实的向量与关键词召回分别最多 60 条，重排后各路轮流取证据，按 evidence_id 去重后最多保留 10 份；不足时使用实际数量。单事实题仍用原问题检索。关键词召回读取 Chroma 已有的 FTS5 表，无须重新解析论文或建另一套索引。
+- 事实规划只列检索问题，不给答案；格式异常时回退原问题。检索命中只是候选，生成时仍需核对题目的年份、对象和范围；多事实题会增加检索和 API 耗时。
 - PDF 部分解析成功时告警并使用可用内容；整篇解析失败或没有任何可入库内容时仍抛错。
 - 元素截图失败或图片缺失时告警，保留可用文字；图片描述为空时回退到图题，没有检索文字则跳过该图。
 - 表格导出失败时保留可用截图和表格块；异常检索记录跳过，不拿图片描述冒充原始证据。
 - 结构化分块遇到内容错误时，回退到已提取元素的普通文本分块；此时可能丢失部分结构和上下文，不代表完整解析质量。
 - 引用、supporting_materials、explanation 的局部异常只整理或降级对应字段，保留已有 answer_value；移除无效引用，不补造来源、引文或推理。保留答案不代表已经验证答案正确。
 - 核心答案缺失、明确拒答或整个输出无法解析时才回退为 is_blank；辅助字段问题不会触发整题拒答。系统回退不代表该题客观上不可回答。
-- answer_value 用字符串 `[low, high]` 表示可接受区间，用 `(a, b)` 表示两个值都必须提供；不把跨论文的两个独立数值误写成区间。
+- 评分器将标准答案中的 `[low, high]` 当作单值容忍范围；预测单个数值时应给有证据支持的点值。题目要求两个端点或多个独立数值时用字符串 `(a, b)`，不能将预测的不确定性写成 `[low, high]`。模型偶尔返回的 True/False 会归一化为比赛要求的 1/0。
 - 空索引、模型加载、API/鉴权/额度、必需配置及文件读写等系统级错误仍中止；可选描述缓存读写失败只告警。不使用捕获全部异常后继续运行的方式。
 
 离线回归检查：`uv run python -m unittest discover -s tests -v`。测试替换模型、解析器和索引，不调用 API、不下载模型、不改动现有索引；不代表全量论文或答案质量验证。

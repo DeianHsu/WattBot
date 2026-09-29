@@ -18,8 +18,10 @@ ROOT = Path(__file__).resolve().parents[2]
 PAPERS_DIR = ROOT / "papers"
 ARTIFACTS_DIR = ROOT / "artifacts"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
-RETRIEVAL_K = 20
-FINAL_TOP_K = 5
+RETRIEVAL_K = 60
+KEYWORD_K = 60
+FINAL_TOP_K = 10
+RERANK_K = RETRIEVAL_K + KEYWORD_K
 logger = logging.getLogger(__name__)
 
 
@@ -62,7 +64,7 @@ def get_reranker():
         model_name="BAAI/bge-reranker-base",
         model_kwargs={"device": "cpu"},
     )
-    return CrossEncoderReranker(model=model, top_n=RETRIEVAL_K)
+    return CrossEncoderReranker(model=model, top_n=RERANK_K)
 
 
 def image_block(image_path):

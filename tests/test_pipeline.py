@@ -34,29 +34,75 @@ def document(evidence_id):
 class PipelineTests(unittest.TestCase):
     """只验证本次修改的分支，不下载模型、不重建真实向量库。"""
 
+    def test_fact_plan_keeps_single_question_and_splits_comparison(self):
+        """普通题保留原问；比较题使用两条完整的事实查询。"""
+        with patch.object(generate, "get_mimo") as mimo:
+            model = mimo.return_value.with_structured_output.return_value
+            model.invoke.side_effect = [
+                generate.SearchPlan(queries=["rewritten simple question"]),
+                generate.SearchPlan(queries=["global average PUE", "GPT-3 facility PUE"]),
+            ]
+            self.assertEqual(generate.plan_queries("simple question"), ["simple question"])
+            self.assertEqual(generate.plan_queries("compare the two PUE values"),
+                             ["global average PUE", "GPT-3 facility PUE"])
+
+    def test_fact_plan_parser_fallback_but_api_error_raises(self):
+        """规划格式异常只回退检索问题，真实 API 故障仍中止。"""
+        with patch.object(generate, "get_mimo") as mimo:
+            model = mimo.return_value.with_structured_output.return_value
+            model.invoke.side_effect = OutputParserException("invalid JSON")
+            with self.assertLogs(generate.logger):
+                self.assertEqual(generate.plan_queries("question"), ["question"])
+            model.invoke.side_effect = ConnectionError("API unavailable")
+            with self.assertRaises(ConnectionError):
+                generate.plan_queries("question")
+
+    def test_fact_results_keep_each_retrieval_branch(self):
+        """逐路合并而非整题重排，重复证据只占一个名额。"""
+        first = [{"evidence_id": "a"}, {"evidence_id": "shared"}]
+        second = [{"evidence_id": "b"}, {"evidence_id": "shared"}]
+        with patch.object(retrieve, "retrieve", side_effect=[first, second]):
+            result = retrieve.retrieve_facts(["fact A", "fact B"])
+        self.assertEqual([item["evidence_id"] for item in result], ["a", "b", "shared"])
+        self.assertEqual(result[-1]["search_facts"], [1, 2])
+        with patch.object(retrieve, "retrieve", side_effect=[
+            [{"evidence_id": f"a{i}"} for i in range(10)], [{"evidence_id": "b0"}]
+        ]):
+            result = retrieve.retrieve_facts(["fact A", "fact B"])
+        self.assertIn("b0", [item["evidence_id"] for item in result])
+        self.assertEqual(len(result), models.FINAL_TOP_K)
+
     def test_deduplicate_before_top_k(self):
-        """前六条属于同表时，后续不同证据仍能补足五份。"""
-        ranked = [document("table")] * 6 + [document(str(i)) for i in range(6)]
-        with patch.object(retrieve, "get_vector_store") as store, patch.object(retrieve, "get_reranker") as reranker:
+        """重复表块不占满名额，后续不同证据可以补足最终十份。"""
+        ranked = [document("table")] * 12 + [document(str(i)) for i in range(11)]
+        with patch.object(retrieve, "get_vector_store") as store, patch.object(retrieve, "keyword_search", return_value=[]), patch.object(retrieve, "get_reranker") as reranker:
             store.return_value.similarity_search.return_value = ranked
             reranker.return_value.compress_documents.return_value = ranked
             result = retrieve.retrieve("question")
-            self.assertEqual([r["evidence_id"] for r in result], ["table", "0", "1", "2", "3"])
-            store.return_value.similarity_search.assert_called_once_with("question", k=20)
+            self.assertEqual([r["evidence_id"] for r in result], ["table", *map(str, range(9))])
+            store.return_value.similarity_search.assert_called_once_with("question", k=models.RETRIEVAL_K)
             self.assertEqual(result[0]["content"], "original table")
 
+    def test_keyword_candidate_enters_reranking(self):
+        """关键词找到的新证据与向量候选一起重排。"""
+        with patch.object(retrieve, "get_vector_store") as store, patch.object(retrieve, "keyword_search", return_value=[document("keyword")]), patch.object(retrieve, "get_reranker") as reranker:
+            store.return_value.similarity_search.return_value = [document("dense")]
+            reranker.return_value.compress_documents.side_effect = lambda documents, query: documents
+            result = retrieve.retrieve("question")
+            self.assertEqual([r["evidence_id"] for r in result], ["dense", "keyword"])
+
     def test_reranker_keeps_all_candidates(self):
-        """配置保留二十条排序结果，不提前截为最终五条。"""
+        """配置保留全部召回候选，不提前截为最终证据数。"""
         with patch.object(models, "HuggingFaceCrossEncoder"), patch.object(models, "CrossEncoderReranker") as factory:
             models.get_reranker.__wrapped__()
-            self.assertEqual(factory.call_args.kwargs["top_n"], models.RETRIEVAL_K)
+            self.assertEqual(factory.call_args.kwargs["top_n"], models.RERANK_K)
 
     def test_bad_record_skipped_and_short_result_allowed(self):
         """损坏记录不占名额，证据不足时不重复填充。"""
         bad = document("bad")
         bad.metadata["pages"] = "invalid JSON"
         ranked = [bad, document("good"), document("good")]
-        with patch.object(retrieve, "get_vector_store") as store, patch.object(retrieve, "get_reranker") as reranker:
+        with patch.object(retrieve, "get_vector_store") as store, patch.object(retrieve, "keyword_search", return_value=[]), patch.object(retrieve, "get_reranker") as reranker:
             store.return_value.similarity_search.return_value = ranked
             reranker.return_value.compress_documents.return_value = ranked
             with self.assertLogs(retrieve.logger, level="WARNING"):
@@ -102,7 +148,7 @@ class PipelineTests(unittest.TestCase):
         """无合法引用时只清空提交引用，不抹掉已有答案和文字。"""
         draft = {"answer": "42", "answer_value": 42, "ref_ids": ["invented"],
                  "supporting_materials": "quote", "explanation": "reason"}
-        with patch.object(generate, "retrieve", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft), self.assertLogs(generate.logger):
+        with patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft), self.assertLogs(generate.logger):
             row = generate.answer_one({"id": "q1", "question": "q"}, {})
             for key in ("ref_id", "ref_url"):
                 self.assertEqual(row[key], "is_blank")
@@ -110,6 +156,17 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(row["answer"], "42")
             self.assertEqual(row["supporting_materials"], "quote")
             self.assertEqual(row["explanation"], "reason")
+
+    def test_true_false_values_use_competition_format(self):
+        """模型写出 True/False 时，提交值稳定转换为 1/0。"""
+        record = {**document("text").metadata, "pages": [1], "image_paths": []}
+        for raw, expected in (("True", "1"), ("FALSE", "0"), ("1.25", "1.25")):
+            with self.subTest(raw=raw), patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "generate_answer", return_value={
+                "answer": raw, "answer_value": raw, "ref_ids": ["paper"],
+                "supporting_materials": "quote", "explanation": "reason",
+            }):
+                row = generate.answer_one({"id": "q", "question": "q"}, {"paper": {"url": "https://example.com"}})
+                self.assertEqual(row["answer_value"], expected)
 
     def test_auxiliary_fields_do_not_break_structured_parser(self):
         """辅助字段缺失、空值或错类型时，真实解析器仍保留核心答案。"""
@@ -123,7 +180,7 @@ class PipelineTests(unittest.TestCase):
         for auxiliary in variants:
             with self.subTest(auxiliary=auxiliary):
                 draft = parser.parse(json.dumps({"answer_value": 42, **auxiliary}))
-                with patch.object(generate, "retrieve", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft.model_dump()), self.assertLogs(generate.logger):
+                with patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft.model_dump()), self.assertLogs(generate.logger):
                     row = generate.answer_one({"id": "q", "question": "q"}, {"paper": {"url": "https://example.com"}})
                 self.assertEqual(row["answer_value"], "42")
                 self.assertTrue(row["explanation"])
@@ -132,7 +189,7 @@ class PipelineTests(unittest.TestCase):
     def test_explicit_abstention_still_clears_evidence(self):
         """核心答案明确拒答时继续遵守比赛的联动清空规则。"""
         draft = generate.AnswerDraft(answer_value="is_blank", answer="unanswerable", ref_ids=["paper"], supporting_materials="quote", explanation="Insufficient evidence.")
-        with patch.object(generate, "retrieve", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft.model_dump()):
+        with patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft.model_dump()):
             row = generate.answer_one({"id": "q", "question": "q"}, {"paper": {"url": "https://example.com"}})
         for field in ("answer", "answer_value", "ref_id", "ref_url", "supporting_materials"):
             self.assertEqual(row[field], "is_blank")
@@ -144,14 +201,15 @@ class PipelineTests(unittest.TestCase):
             parser.parse('{"explanation": "no answer"}')
 
     def test_range_and_pair_strings_preserved(self):
-        """区间与必需数值对保持不同括号，辅助字段降级不改变它们。"""
+        """单值题禁止自造区间；兼容读取已有区间与必需数值对。"""
         parser = PydanticOutputParser(pydantic_object=generate.AnswerDraft)
         self.assertIn('[low, high]', generate.SYSTEM_PROMPT)
         self.assertIn('(a, b)', generate.SYSTEM_PROMPT)
+        self.assertIn('return your best-supported single number', generate.SYSTEM_PROMPT)
         for value in ("[10, 12]", "(0.18, 3.1)"):
             with self.subTest(value=value):
                 draft = parser.parse(json.dumps({"answer_value": value}))
-                with patch.object(generate, "retrieve", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft.model_dump()), self.assertLogs(generate.logger):
+                with patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[{"ref_id": "paper"}]), patch.object(generate, "generate_answer", return_value=draft.model_dump()), self.assertLogs(generate.logger):
                     row = generate.answer_one({"id": "q", "question": "q"}, {})
                 self.assertEqual(row["answer_value"], value)
 
@@ -226,14 +284,17 @@ class PipelineTests(unittest.TestCase):
 
     def test_generation_omits_missing_image(self):
         """缺图后仍发送文字，并明确提醒模型不能推测图中数值。"""
-        record = {**document("table").metadata, "pages": [1], "image_paths": ["missing.png"]}
+        record = {**document("table").metadata, "pages": [1],
+                  "image_paths": ["missing.png"], "search_facts": [2]}
         with patch.object(generate, "image_block", return_value=None), patch.object(generate, "get_mimo") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.return_value = generate.AnswerDraft(**generate.blank_answer("Insufficient evidence."))
-            generate.generate_answer("q", "", [record])
+            generate.generate_answer("q", "", [record], ["first fact", "second fact"])
             content = model.invoke.call_args.args[0][1].content
             self.assertTrue(all(block["type"] == "text" for block in content))
             self.assertTrue(any("unavailable" in block["text"] for block in content))
+            self.assertIn("2. second fact", content[0]["text"])
+            self.assertIn("candidate_for_facts=[2]", content[1]["text"])
 
     def test_picture_description_reuses_exact_duplicates(self):
         """精确重复图片只生成一次描述，但返回每个图片元素的结果。"""
@@ -263,7 +324,7 @@ class PipelineTests(unittest.TestCase):
             (root / "input").mkdir()
             (root / "input/metadata.csv").write_text("id,url\npaper,https://example.com/paper\n", encoding="utf-8")
             (root / "input/test_Q.csv").write_text("id,question\nq1,first\nq2,second\n", encoding="utf-8")
-            with patch.object(generate, "ROOT", root), patch.object(generate, "retrieve", return_value=[record]), patch.object(generate, "get_mimo") as mimo, self.assertLogs(generate.logger):
+            with patch.object(generate, "ROOT", root), patch.object(generate, "plan_queries", side_effect=lambda question: [question]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "get_mimo") as mimo, self.assertLogs(generate.logger):
                 mimo.return_value.with_structured_output.return_value.invoke.side_effect = [OutputParserException("bad JSON"), valid]
                 output = generate.predict_all()
             with output.open(encoding="utf-8", newline="") as file:
