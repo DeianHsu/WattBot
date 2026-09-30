@@ -49,10 +49,14 @@ def get_mimo():
 @lru_cache(maxsize=1)
 def get_embeddings():
     """加载文本向量模型，用于正文、表格文本、图片描述和问题。"""
+    # 建库和问题检索共用 GPU 向量模型；CUDA 不可用时立即报错，避免隐式退回 CPU。
+    if not torch.cuda.is_available():
+        raise RuntimeError("Embedding 需要 CUDA，但当前 PyTorch 无法使用 GPU；请运行 uv sync 并检查 torch.cuda.is_available()")
+
     # 归一化向量，并在当前进程中复用模型，避免每道题重复加载。
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},
+        model_kwargs={"device": "cuda"},
         encode_kwargs={"normalize_embeddings": True},
     )
 

@@ -39,7 +39,7 @@ uv sync
 .venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-Windows 的 PyTorch 从官方 CUDA 13.0 索引安装。第二条命令应输出 `True`；重排必须能访问 CUDA，不会自动退回 CPU。向量 embedding 仍在 CPU，已有 Chroma 索引不需要重建。
+Windows 的 PyTorch 从官方 CUDA 13.0 索引安装。第二条命令应输出 `True`；embedding 和重排都必须能访问 CUDA，不会自动退回 CPU。模型和向量维度未变，已有 Chroma 索引不需要重建。
 
 在已有 .env 中添加 MIMO_API_KEY，格式参考 .env.example。保留其他配置，不提交真实密钥。
 
@@ -70,6 +70,7 @@ uv run python -m wattbot.evaluate input/train_QA.csv artifacts/dev_baseline.csv
 
 - 默认论文位于 papers/，文件名去掉扩展名后即官方 ref_id。
 - 输入为 input/test_Q.csv 和 input/metadata.csv；输出为 submissions/test_submission.csv。
+- 预测最多同时处理 3 题；不同题目的 MiMo 请求可重叠，本地检索与 GPU 重排串行，输出仍按问题文件顺序排列。
 - 所有答案生成成功后一次写出 CSV；不保存中间结果，中断后需要重新预测。
 - 图片描述使用同名 .txt 缓存，不再计算哈希。默认论文不变；修改论文、描述提示词或模型后，需要清理对应描述文件再建库。
 - 首次建库可能下载模型。图片描述、问题事实规划及问答会调用 MiMo，正文和表格解析不调用 MiMo。

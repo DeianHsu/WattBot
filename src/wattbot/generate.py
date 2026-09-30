@@ -3,17 +3,24 @@
 import csv
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
+from threading import Lock
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.exceptions import OutputParserException
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from wattbot.models import ROOT, get_mimo, image_block
+from wattbot.index import get_vector_store
+from wattbot.models import ROOT, get_mimo, get_reranker, image_block
 from wattbot.retrieve import retrieve_facts
 
 
 logger = logging.getLogger(__name__)
+# 题目级并发只用于重叠远程请求；本地检索由锁保护。
+PREDICT_WORKERS = 3
+RETRIEVAL_LOCK = Lock()
 
 
 class SearchPlan(BaseModel):
@@ -236,9 +243,10 @@ def generate_answer(question: str, answer_unit: str, evidence, facts=None):
 
 def answer_one(row, metadata_by_id):
     """完成一道题的检索、生成、引用整理和比赛字段归一化。"""
-    # 先按必需事实分别检索，再合并原始证据；检索命中不等于事实已被证明。
+    # MiMo 调用可跨题并发；共享的本地索引和 GPU 重排模型一次只供一题检索。
     facts = plan_queries(row["question"])
-    evidence = retrieve_facts(facts)
+    with RETRIEVAL_LOCK:
+        evidence = retrieve_facts(facts)
     if evidence:
         draft = generate_answer(row["question"], row.get("answer_unit", ""), evidence, facts)
     else:
@@ -294,7 +302,7 @@ def answer_one(row, metadata_by_id):
 
 
 def predict_all(input_path=None, output_path=None):
-    """逐题预测并写出 CSV；辅助字段局部降级，系统级失败保留已有输出文件。"""
+    """并发预测后按输入顺序写出 CSV；系统级失败保留已有输出文件。"""
     # 所有默认路径相对项目根目录；可指定其他问题文件用于后续小范围运行。
     input_path = Path(input_path) if input_path else ROOT / "input/test_Q.csv"
     output_path = (
@@ -316,11 +324,21 @@ def predict_all(input_path=None, output_path=None):
         if name not in fieldnames:
             fieldnames.append(name)
 
-    # 先生成全部答案，失败时不动已有提交文件；不再维护中间 CSV。
+    # 先加载共享客户端和本地模型，避免多个工作线程重复初始化 GPU 模型。
+    if rows:
+        get_mimo()
+        get_vector_store()
+        get_reranker()
+
+    # 最多同时处理三题；map 保持输入顺序，有限缓冲避免故障后排队过多 API 请求。
+    # 全部成功后才写文件，任一系统级错误不会覆盖已有提交结果。
     predictions = []
-    for number, row in enumerate(rows, start=1):
-        predictions.append(answer_one(row, metadata_by_id))
-        print(f"已完成 {number}/{len(rows)}：{row['id']}", flush=True)
+    with ThreadPoolExecutor(max_workers=PREDICT_WORKERS) as pool:
+        results = pool.map(partial(answer_one, metadata_by_id=metadata_by_id), rows,
+                           buffersize=PREDICT_WORKERS * 2)
+        for number, (row, prediction) in enumerate(zip(rows, results), start=1):
+            predictions.append(prediction)
+            print(f"已完成 {number}/{len(rows)}：{row['id']}", flush=True)
 
     # 全部生成成功后一次写出比赛要求的 CSV。
     output_path.parent.mkdir(parents=True, exist_ok=True)

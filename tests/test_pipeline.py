@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -97,6 +98,19 @@ class PipelineTests(unittest.TestCase):
             models.get_reranker.__wrapped__()
             self.assertEqual(factory.call_args.kwargs["top_n"], models.RERANK_K)
             self.assertEqual(encoder.call_args.kwargs["model_kwargs"]["device"], "cuda")
+
+    def test_embeddings_use_cuda(self):
+        """建库和查询使用同一个 GPU embedding 配置。"""
+        with patch.object(models.torch.cuda, "is_available", return_value=True), patch.object(models, "HuggingFaceEmbeddings") as factory:
+            models.get_embeddings.__wrapped__()
+            self.assertEqual(factory.call_args.kwargs["model_kwargs"]["device"], "cuda")
+            self.assertTrue(factory.call_args.kwargs["encode_kwargs"]["normalize_embeddings"])
+
+    def test_embeddings_require_cuda(self):
+        """CUDA 不可用时不悄悄使用 CPU embedding。"""
+        with patch.object(models.torch.cuda, "is_available", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "Embedding 需要 CUDA"):
+                models.get_embeddings.__wrapped__()
 
     def test_reranker_requires_cuda(self):
         """CUDA 不可用时明确失败，不隐式退回 CPU。"""
@@ -331,13 +345,40 @@ class PipelineTests(unittest.TestCase):
             (root / "input").mkdir()
             (root / "input/metadata.csv").write_text("id,url\npaper,https://example.com/paper\n", encoding="utf-8")
             (root / "input/test_Q.csv").write_text("id,question\nq1,first\nq2,second\n", encoding="utf-8")
-            with patch.object(generate, "ROOT", root), patch.object(generate, "plan_queries", side_effect=lambda question: [question]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "get_mimo") as mimo, self.assertLogs(generate.logger):
-                mimo.return_value.with_structured_output.return_value.invoke.side_effect = [OutputParserException("bad JSON"), valid]
+            def draft_for(question, *_):
+                """按题目稳定返回局部回退或有效答案，不依赖线程执行顺序。"""
+                return (generate.blank_answer("Generation fallback: bad JSON")
+                        if question == "first" else valid.model_dump())
+
+            with patch.object(generate, "ROOT", root), patch.object(generate, "plan_queries", side_effect=lambda question: [question]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "get_mimo"), patch.object(generate, "get_vector_store"), patch.object(generate, "get_reranker"), patch.object(generate, "generate_answer", side_effect=draft_for):
                 output = generate.predict_all()
             with output.open(encoding="utf-8", newline="") as file:
                 rows = list(csv.DictReader(file))
             self.assertEqual([row["answer_value"] for row in rows], ["is_blank", "42"])
             self.assertEqual(json.loads(rows[1]["ref_id"]), ["paper"])
+
+    def test_predict_runs_three_questions_concurrently_in_input_order(self):
+        """三个工作线程确实重叠执行，CSV 顺序仍与输入一致。"""
+        barrier = Barrier(3)
+
+        def fake_answer(row, metadata_by_id):
+            """等待三题同时进入工作线程，然后返回可区分的答案。"""
+            barrier.wait(timeout=5)
+            return {**row, "answer_value": row["id"]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "input").mkdir()
+            (root / "input/metadata.csv").write_text("id,url\n", encoding="utf-8")
+            (root / "input/test_Q.csv").write_text(
+                "id,question\nq1,first\nq2,second\nq3,third\n", encoding="utf-8"
+            )
+            with patch.object(generate, "ROOT", root), patch.object(generate, "get_mimo"), patch.object(generate, "get_vector_store"), patch.object(generate, "get_reranker"), patch.object(generate, "answer_one", side_effect=fake_answer):
+                output = generate.predict_all()
+            with output.open(encoding="utf-8", newline="") as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual([row["id"] for row in rows], ["q1", "q2", "q3"])
+            self.assertEqual([row["answer_value"] for row in rows], ["q1", "q2", "q3"])
 
 
 # 标准库 unittest 足够完成本次离线回归，不引入额外测试依赖。
