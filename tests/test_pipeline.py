@@ -92,10 +92,17 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual([r["evidence_id"] for r in result], ["dense", "keyword"])
 
     def test_reranker_keeps_all_candidates(self):
-        """配置保留全部召回候选，不提前截为最终证据数。"""
-        with patch.object(models, "HuggingFaceCrossEncoder"), patch.object(models, "CrossEncoderReranker") as factory:
+        """GPU 重排保留全部候选，不提前截为最终证据数。"""
+        with patch.object(models.torch.cuda, "is_available", return_value=True), patch.object(models, "HuggingFaceCrossEncoder") as encoder, patch.object(models, "CrossEncoderReranker") as factory:
             models.get_reranker.__wrapped__()
             self.assertEqual(factory.call_args.kwargs["top_n"], models.RERANK_K)
+            self.assertEqual(encoder.call_args.kwargs["model_kwargs"]["device"], "cuda")
+
+    def test_reranker_requires_cuda(self):
+        """CUDA 不可用时明确失败，不隐式退回 CPU。"""
+        with patch.object(models.torch.cuda, "is_available", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "重排需要 CUDA"):
+                models.get_reranker.__wrapped__()
 
     def test_bad_record_skipped_and_short_result_allowed(self):
         """损坏记录不占名额，证据不足时不重复填充。"""

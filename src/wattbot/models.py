@@ -6,6 +6,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
+import torch
 from dotenv import load_dotenv
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
@@ -59,10 +60,14 @@ def get_embeddings():
 @lru_cache(maxsize=1)
 def get_reranker():
     """加载文本重排模型；图片通过描述参与重排，而不是直接输入原图。"""
+    # 没有可用 CUDA 时立即停止，避免整批预测悄悄落回 CPU 跑数小时。
+    if not torch.cuda.is_available():
+        raise RuntimeError("重排需要 CUDA，但当前 PyTorch 无法使用 GPU；请运行 uv sync 并检查 torch.cuda.is_available()")
+
     # 保留全部召回候选的重排结果，最终名额在 evidence_id 去重后截取。
     model = HuggingFaceCrossEncoder(
         model_name="BAAI/bge-reranker-base",
-        model_kwargs={"device": "cpu"},
+        model_kwargs={"device": "cuda"},
     )
     return CrossEncoderReranker(model=model, top_n=RERANK_K)
 

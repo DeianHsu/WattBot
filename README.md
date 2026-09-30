@@ -36,7 +36,10 @@ PDF → Docling
 
 ```powershell
 uv sync
+.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
+
+Windows 的 PyTorch 从官方 CUDA 13.0 索引安装。第二条命令应输出 `True`；重排必须能访问 CUDA，不会自动退回 CPU。向量 embedding 仍在 CPU，已有 Chroma 索引不需要重建。
 
 在已有 .env 中添加 MIMO_API_KEY，格式参考 .env.example。保留其他配置，不提交真实密钥。
 
@@ -74,7 +77,6 @@ uv run python -m wattbot.evaluate input/train_QA.csv artifacts/dev_baseline.csv
 - 使用 wattbot_multimodal_v2 collection，旧的纯文本 wattbot collection 不变。按论文替换索引时，写入失败可能留下该论文的部分记录，需要重新建这篇论文。
 - 本次改变了 metadata 格式，若已经运行过上一版多模态建库，必须重新完成全部论文的建库后再预测；旧 evidence.json 不再使用，本次没有删除任何已生成的数据。
 - 已用两篇论文的四页完成小样测试；补全 JSON Schema 后，四道题均通过结构化解析、答案数值对照和批量 CSV 写出。该结果不代表全量准确率，完整测试集尚未运行。
-- 依赖声明已有更新，但本次没有安装依赖或更新 uv.lock；后续 uv sync 会同步锁文件。
 - 当前仍是基于图片描述检索的多模态 RAG，不是视觉向量检索。跨论文题按必需事实分别检索；计算和拒答仍由提示词约束，不含独立计算工具。
 
 ## 建库耗时与图片处理

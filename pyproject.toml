@@ -20,7 +20,17 @@ dependencies = [
     "pypdf>=6.19.0",
     "python-dotenv>=1.2.3",
     "sentence-transformers>=6.1.0",
+    "torch==2.14.0",
 ]
+
+# Windows 上从 PyTorch 官方索引安装 CUDA 版；其他平台沿用默认来源。
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [project.scripts]
 wattbot = "wattbot.main:main"
