@@ -35,17 +35,29 @@ def document(evidence_id):
 class PipelineTests(unittest.TestCase):
     """只验证本次修改的分支，不下载模型、不重建真实向量库。"""
 
-    def test_fact_plan_keeps_single_question_and_splits_comparison(self):
-        """普通题保留原问；比较题使用两条完整的事实查询。"""
+    def test_fact_plan_keeps_original_and_rewrite_and_splits_comparison(self):
+        """单事实保留原问和术语改写；比较题仍保留各项事实。"""
         with patch.object(generate, "get_mimo") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.side_effect = [
                 generate.SearchPlan(queries=["rewritten simple question"]),
                 generate.SearchPlan(queries=["global average PUE", "GPT-3 facility PUE"]),
             ]
-            self.assertEqual(generate.plan_queries("simple question"), ["simple question"])
+            self.assertEqual(generate.plan_queries("simple question"),
+                             ["simple question", "rewritten simple question"])
             self.assertEqual(generate.plan_queries("compare the two PUE values"),
                              ["global average PUE", "GPT-3 facility PUE"])
+
+    def test_single_query_rewrite_deduplicates_and_empty_plan_falls_back(self):
+        """相同改写不重复检索，空规划仍使用原问题。"""
+        with patch.object(generate, "get_mimo") as mimo:
+            model = mimo.return_value.with_structured_output.return_value
+            model.invoke.side_effect = [
+                generate.SearchPlan(queries=[" question ", "question"]),
+                generate.SearchPlan(queries=[" "]),
+            ]
+            self.assertEqual(generate.plan_queries("question"), ["question"])
+            self.assertEqual(generate.plan_queries("question"), ["question"])
 
     def test_fact_plan_parser_fallback_but_api_error_raises(self):
         """规划格式异常只回退检索问题，真实 API 故障仍中止。"""
@@ -234,6 +246,252 @@ class PipelineTests(unittest.TestCase):
                     row = generate.answer_one({"id": "q", "question": "q"}, {})
                 self.assertEqual(row["answer_value"], value)
 
+    def test_decimal_calculation_and_unit_conversion(self):
+        """十进制加法、比值和单位转换保留精度，不依赖模型心算。"""
+        self.assertEqual(generate.calculate("v1 + v2", ["0.1", "0.2"]), "0.3")
+        self.assertEqual(generate.calculate("(v1 - v2) * 1000", ["1.2", "0.3"]), "900")
+        self.assertEqual(generate.calculate("-v1 / +v2", ["3", "2"]), "-1.5")
+        self.assertTrue(generate.calculate("v1 / v2", ["1.58", "1.10"]).startswith("1.4363636363"))
+        for expression in ("v1 ** 2", "round(v1)", "v2 + 1", "v1.real", "1 + 2"):
+            with self.subTest(expression=expression), self.assertRaises(ValueError):
+                generate.calculate(expression, ["3"])
+
+    def test_verified_calculation_updates_answer_and_explanation(self):
+        """复算结果同时更新答案和说明，内部数值字段不进入提交。"""
+        fact = generate.NumericFact(value="1.25", unit="kWh", conditions="measured task total",
+                                    evidence_id="text", matches_question=True)
+        draft = generate.AnswerDraft(answer_value="1249", numeric_facts=[fact],
+                                     calculation="v1 * 1000", ref_ids=["paper"]).model_dump()
+        record = {**document("text").metadata, "pages": [1], "image_paths": []}
+        result = generate.verify_numeric_answer(draft, [record], "Wh")
+        self.assertEqual(result["answer_value"], "1250")
+        self.assertEqual(result["answer"], "1250 Wh")
+        self.assertIn("v1 * 1000 = 1250 Wh", result["explanation"])
+        with patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "generate_answer", return_value=result), self.assertLogs(generate.logger):
+            row = generate.answer_one({"id": "q", "question": "q"}, {"paper": {"url": "https://example.com"}})
+        self.assertNotIn("numeric_facts", row)
+        self.assertNotIn("calculation", row)
+
+    def test_mismatched_required_quantity_abstains(self):
+        """模型明确认定所选均值不满足最小值条件时，不继续拿它计算。"""
+        fact = generate.NumericFact(value="0.7", unit="g", conditions="mean, not minimum",
+                                    evidence_id="text", matches_question=False)
+        draft = generate.AnswerDraft(answer_value="0.7", numeric_facts=[fact]).model_dump()
+        result = generate.verify_numeric_answer(draft, [document("text").metadata], "g")
+        self.assertEqual(result["answer_value"], "is_blank")
+        self.assertIn("mean, not minimum", result["explanation"])
+
+    def test_bad_audit_or_formula_preserves_core_answer(self):
+        """来源标记、核对结构或算式异常只停用复算，不抹掉已有答案。"""
+        parser = PydanticOutputParser(pydantic_object=generate.AnswerDraft)
+        with self.assertLogs(generate.logger):
+            draft = parser.parse('{"answer_value": 42, "numeric_facts": [{"value": 1}]}')
+        self.assertEqual(draft.answer_value, 42)
+        self.assertEqual(draft.numeric_facts, [])
+        fact = generate.NumericFact(value="42", unit="", conditions="reported total",
+                                    evidence_id="text", matches_question=True)
+        record = document("text").metadata
+        for expression, source in (("v1 / 0", "text"), ("v1 + v2", "text"), ("v1", "unknown")):
+            with self.subTest(expression=expression, source=source), self.assertLogs(generate.logger):
+                draft = generate.AnswerDraft(answer_value="42", calculation=expression,
+                    numeric_facts=[fact.model_copy(update={"evidence_id": source})]).model_dump()
+                self.assertEqual(generate.verify_numeric_answer(draft, [record], "")["answer_value"], "42")
+
+    def test_unresolved_visual_conflict_abstains(self):
+        """两份真实图像的条件匹配读数无法协调时，不继续输出任意一份。"""
+        readings = [generate.NumericFact(value=value, unit="seconds",
+                    conditions="target model, batch=1, stacked total",
+                    evidence_id=key, matches_question=True)
+                    for key, value in (("stages", "2.7"), ("layers", "2.0"))]
+        draft = generate.AnswerDraft(answer_value="2.7", visual_readings=readings,
+                    unresolved_conflict=True, selection_reason="The scope difference is unsupported.").model_dump()
+        evidence = [{"evidence_id": key, "image_paths": [f"{key}.png"]}
+                    for key in ("stages", "layers")]
+        result = generate.verify_visual_answer(draft, evidence)
+        self.assertEqual(result["answer_value"], "is_blank")
+        self.assertIn("stages: 2.7 seconds", result["explanation"])
+        self.assertIn("layers: 2.0 seconds", result["explanation"])
+        self.assertIn("scope difference", result["explanation"])
+
+    def test_quote_owner_corrects_citation_without_changing_answer(self):
+        """引用挂错真实论文时，通过逐字原文找回唯一来源，数值保持不变。"""
+        quote = "The most efficient region averages 200 grams per kWh."
+        evidence = [
+            {"evidence_id": "wrong", "ref_id": "unrelated", "content": "Grid intensity definitions.", "pages": [39], "image_paths": []},
+            {"evidence_id": "right", "ref_id": "actual", "content": "Results: " + quote, "pages": [10], "image_paths": []},
+        ]
+        draft = generate.AnswerDraft(answer_value=200, ref_ids=["unrelated"],
+            supports=[generate.EvidenceSupport(evidence_id="wrong", quote=quote)],
+            numeric_facts=[generate.NumericFact(value=200, unit="g/kWh", conditions="average",
+                evidence_id="wrong", matches_question=True)]).model_dump()
+        with self.assertLogs(generate.logger):
+            result = generate.verify_supports(draft, evidence)
+        self.assertEqual(result["answer_value"], 200)
+        self.assertEqual(result["ref_ids"], ["actual"])
+        self.assertEqual(result["numeric_facts"][0]["evidence_id"], "right")
+        self.assertIn("[right; pages=[10]]", result["supporting_materials"])
+
+    def test_quote_check_keeps_cross_paper_and_skips_invalid_support(self):
+        """跨论文运算保留两篇真实支持，虚构引文只跳过本条。"""
+        evidence = [{"evidence_id": key, "ref_id": key, "content": quote,
+                     "pages": [1], "image_paths": []}
+                    for key, quote in (("a", "Measured energy for experiment A is 20 kWh."),
+                                       ("b", "Measured energy for experiment B is 10 kWh."))]
+        supports = [generate.EvidenceSupport(evidence_id=item["evidence_id"], quote=item["content"])
+                    for item in evidence]
+        supports.append(generate.EvidenceSupport(evidence_id="a", quote="Invented unsupported result of 42 kWh."))
+        draft = generate.AnswerDraft(answer_value="2", supports=supports).model_dump()
+        with self.assertLogs(generate.logger):
+            result = generate.verify_supports(draft, evidence)
+        self.assertEqual(result["answer_value"], "2")
+        self.assertEqual(result["ref_ids"], ["a", "b"])
+        self.assertNotIn("Invented", result["supporting_materials"])
+
+    def test_support_alias_is_restored_after_generation(self):
+        """短标签由程序还原，不依赖模型抄写论文或图号。"""
+        record = {**document("paper:text:1").metadata, "pages": [1], "image_paths": [],
+                  "content": "The measured average is 200 grams per kWh."}
+        draft = generate.AnswerDraft(answer_value=200,
+                    supports=[generate.EvidenceSupport(evidence_id="E1", quote=record["content"])])
+        with patch.object(generate, "get_mimo") as mimo:
+            mimo.return_value.with_structured_output.return_value.invoke.return_value = draft
+            result = generate.generate_answer("q", "g/kWh", [record])
+        self.assertEqual(result["supports"][0]["evidence_id"], "paper:text:1")
+        self.assertEqual(result["ref_ids"], ["paper"])
+
+    def test_bad_support_record_preserves_core_answer(self):
+        """新增支持结构局部损坏时，延续已有辅助字段降级规则。"""
+        with self.assertLogs(generate.logger):
+            draft = generate.AnswerDraft(answer_value=42, supports=[{"quote": "missing id"}])
+        self.assertEqual(draft.answer_value, 42)
+        self.assertEqual(draft.supports, [])
+
+    def test_entirely_unsupported_quote_clears_only_citation(self):
+        """整组引文均不在原文中时清空引用，核心答案仍保留。"""
+        record = {**document("text").metadata, "pages": [1], "image_paths": []}
+        draft = generate.AnswerDraft(answer_value=42, ref_ids=["paper"],
+                    supports=[generate.EvidenceSupport(evidence_id="text", quote="An invented quotation that is absent from the source.")]).model_dump()
+        with self.assertLogs(generate.logger):
+            result = generate.verify_supports(draft, [record])
+        self.assertEqual(result["answer_value"], 42)
+        self.assertEqual(result["ref_ids"], [])
+        self.assertEqual(result["supporting_materials"], "is_blank")
+
+    def test_resolved_or_invalid_visual_check_preserves_core(self):
+        """已解决差异、损坏记录、单一来源或不存在的图片来源均保留核心值。"""
+        fact = generate.NumericFact(value="2", unit="seconds", conditions="target total",
+                                   evidence_id="first", matches_question=True)
+        record = {"evidence_id": "first", "image_paths": ["first.png"]}
+        draft = generate.AnswerDraft(answer_value="2", visual_readings=[fact]).model_dump()
+        self.assertEqual(generate.verify_visual_answer(draft, [record])["answer_value"], "2")
+        for other in (fact, fact.model_copy(update={"evidence_id": "missing"}),
+                      fact.model_copy(update={"evidence_id": "second", "matches_question": False})):
+            with self.subTest(other=other), self.assertLogs(generate.logger):
+                draft = generate.AnswerDraft(answer_value="2", visual_readings=[fact, other],
+                                             unresolved_conflict=True).model_dump()
+                self.assertEqual(generate.verify_visual_answer(draft, [record])["answer_value"], "2")
+        parser = PydanticOutputParser(pydantic_object=generate.AnswerDraft)
+        with self.assertLogs(generate.logger):
+            draft = parser.parse('{"answer_value": 2, "visual_readings": [{"value": 3}], "unresolved_conflict": "false"}')
+        self.assertEqual(draft.answer_value, 2)
+        self.assertEqual(draft.visual_readings, [])
+        self.assertFalse(draft.unresolved_conflict)
+
+    def test_independent_chart_reading_binds_actual_source(self):
+        """单图阅读只附当前图片，模型抄错来源时由程序覆盖。"""
+        records = [{**document(key).metadata, "ref_id": "paper", "modality": "image",
+                    "pages": [1], "image_paths": [f"{key}.png"]}
+                   for key in ("first", "second")]
+        reading = generate.NumericFact(value=2, unit="seconds", conditions="stacked total",
+                                        evidence_id="wrong", matches_question=True)
+        with patch.object(generate, "image_block", return_value={"type": "image_url"}) as image, patch.object(generate, "get_mimo") as mimo:
+            model = mimo.return_value.with_structured_output.return_value
+            model.invoke.return_value = generate.ChartReadings(readings=[reading])
+            result = generate.read_chart("q", "seconds", records[0], records)
+        image.assert_called_once_with("first.png")
+        self.assertEqual(result[0]["evidence_id"], "first")
+        self.assertEqual(sum(block["type"] == "image_url" for block in model.invoke.call_args.args[0][1].content), 1)
+
+    def test_multiple_charts_are_read_and_reconciled_once(self):
+        """多图独立阅读后只生成一次，图片不重复附加到协调消息。"""
+        evidence = [{**document(key).metadata, "modality": "image", "pages": [1],
+                     "image_paths": [f"{key}.png"]} for key in ("stages", "layers")]
+        readings = [generate.NumericFact(value=value, unit="seconds", conditions="target stacked total",
+                    evidence_id=key, matches_question=True).model_dump()
+                    for key, value in (("stages", 2.7), ("layers", 2))]
+        final = generate.AnswerDraft(answer_value=2.7, unresolved_conflict=True,
+                    selection_reason="No source passage resolves the conflicting totals.")
+        def isolated_read(question, unit, record, evidence):
+            """按真实来源返回独立读数，结果不受并发完成顺序影响。"""
+            return [reading for reading in readings if reading["evidence_id"] == record["evidence_id"]]
+        with patch.object(generate, "image_block", return_value={"type": "image_url"}), patch.object(generate, "read_chart", side_effect=isolated_read) as read, patch.object(generate, "get_mimo") as mimo:
+            model = mimo.return_value.with_structured_output.return_value
+            model.bind.return_value = model
+            model.invoke.return_value = final
+            result = generate.generate_answer("q", "seconds", evidence)
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(model.invoke.call_count, 1)
+        model.bind.assert_called_once_with(extra_body={"thinking": {"type": "disabled"}})
+        self.assertTrue(all(block["type"] == "text" for block in model.invoke.call_args.args[0][1].content))
+        self.assertEqual(result["answer_value"], "is_blank")
+        self.assertIn("layers: 2 seconds", result["explanation"])
+
+    def test_chart_parser_failure_is_local_but_api_failure_raises(self):
+        """单图读数解析失败允许回退，连接错误继续作为系统故障抛出。"""
+        record = {**document("image").metadata, "pages": [1], "image_paths": ["image.png"]}
+        with patch.object(generate, "image_block", return_value={"type": "image_url"}), patch.object(generate, "get_mimo") as mimo:
+            model = mimo.return_value.with_structured_output.return_value
+            model.invoke.side_effect = OutputParserException("bad chart reading")
+            with self.assertLogs(generate.logger):
+                self.assertIsNone(generate.read_chart("q", "s", record, [record]))
+            model.invoke.side_effect = ConnectionError("API unavailable")
+            with self.assertRaises(ConnectionError):
+                generate.read_chart("q", "s", record, [record])
+
+    def test_empty_chart_readings_do_not_repeat_attachments(self):
+        """单图判断没有相关数值时，不重复识别无关图；正文答案照常保留。"""
+        evidence = [{**document(key).metadata, "modality": "image", "pages": [1],
+                     "image_paths": [f"{key}.png"]} for key in ("first", "second")]
+        with patch.object(generate, "read_chart", return_value=[]), patch.object(generate, "image_block") as image, patch.object(generate, "get_mimo") as mimo:
+            model = mimo.return_value.with_structured_output.return_value
+            model.bind.return_value = model
+            model.invoke.return_value = generate.AnswerDraft(answer_value=42)
+            result = generate.generate_answer("q", "grams", evidence)
+        image.assert_not_called()
+        self.assertEqual(result["answer_value"], 42)
+
+    def test_visual_check_uses_only_attached_images(self):
+        """生成后检查只接受已附图的来源；缺图不会误触发程序拒答。"""
+        evidence = [{**document(key).metadata, "pages": [1], "image_paths": [f"{key}.png"]}
+                    for key in ("first", "second")]
+        readings = [generate.NumericFact(value=value, unit="seconds", conditions="target total",
+                                        evidence_id=key, matches_question=True)
+                    for key, value in (("first", "2.7"), ("second", "2"))]
+        draft = generate.AnswerDraft(answer_value="2.7", visual_readings=readings, unresolved_conflict=True)
+        for blocks, expected in (([{"type": "image_url"}] * 2, "is_blank"),
+                                  ([{"type": "image_url"}, None], "2.7")):
+            with self.subTest(expected=expected), patch.object(generate, "image_block", side_effect=blocks), patch.object(generate, "get_mimo") as mimo:
+                mimo.return_value.with_structured_output.return_value.invoke.return_value = draft
+                result = generate.generate_answer("q", "seconds", evidence)
+                self.assertEqual(result["answer_value"], expected)
+                content = mimo.return_value.with_structured_output.return_value.invoke.call_args.args[0][1].content
+                labels = [block["text"] for block in content if block["type"] == "text"
+                          and block["text"].startswith("Attached image")]
+                self.assertIn("Attached image 1: evidence_id=first", labels[0])
+                if expected == "is_blank":
+                    self.assertIn("Attached image 2: evidence_id=second", labels[1])
+
+    def test_visual_audit_fields_are_not_exported(self):
+        """读图检查字段留在内部，不改变比赛 CSV 列。"""
+        record = {**document("image").metadata, "pages": [1], "image_paths": ["image.png"]}
+        draft = generate.AnswerDraft(answer_value="2", answer="2 seconds", ref_ids=["paper"],
+                    supporting_materials="bar total", explanation="matching scope",
+                    selection_reason="Only one chart matches.").model_dump()
+        with patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "generate_answer", return_value=draft):
+            row = generate.answer_one({"id": "q", "question": "q"}, {"paper": {"url": "https://example.com"}})
+        for field in ("visual_readings", "unresolved_conflict", "selection_reason"):
+            self.assertNotIn(field, row)
+
     def test_chunking_failure_uses_extracted_text(self):
         """结构化分块损坏后保留已解析的正文。"""
         chunker = Mock()
@@ -315,7 +573,8 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(all(block["type"] == "text" for block in content))
             self.assertTrue(any("unavailable" in block["text"] for block in content))
             self.assertIn("2. second fact", content[0]["text"])
-            self.assertIn("candidate_for_facts=[2]", content[1]["text"])
+            self.assertIn("candidate_for_queries=[2]", content[1]["text"])
+            self.assertIn("alternative phrasings of the same fact", content[0]["text"])
 
     def test_picture_description_reuses_exact_duplicates(self):
         """精确重复图片只生成一次描述，但返回每个图片元素的结果。"""

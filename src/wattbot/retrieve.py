@@ -96,8 +96,9 @@ def retrieve(question: str):
 
 
 def retrieve_facts(queries):
-    """分别检索每项必需事实，轮流取证据以保留各路结果。"""
+    """逐项检索事实或术语改写，轮流取证据以保留各路结果。"""
     # 每路仍使用已有的混合召回与重排；轮流合并避免某一路独占最终名额。
+    # search_facts 沿用已有字段名，记录查询编号；多条查询可对应同一事实。
     groups = [retrieve(query) for query in queries]
     evidence = {}
     for round_items in zip_longest(*groups):
