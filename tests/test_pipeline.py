@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from threading import Barrier
 from types import SimpleNamespace
@@ -39,18 +40,38 @@ class PipelineTests(unittest.TestCase):
         """生产问答的模拟测试不读取真实论文，页级补充另行测试。"""
         self.enterContext(patch.object(generate, "expand_pages", side_effect=lambda evidence, question="": evidence))
 
+    def test_mimo_defaults_to_non_thinking_without_changing_model_or_timeouts(self):
+        """默认关闭思考，模型、密钥读取和网络设置保持不变；不调用 API。"""
+        # 清除客户端缓存，使用模拟配置验证实际构造参数，不读取真实密钥。
+        models.get_mimo.cache_clear()
+        self.addCleanup(models.get_mimo.cache_clear)
+        with patch.object(models, "load_dotenv"), patch.object(models.os, "getenv", return_value="test-key"), \
+             patch.object(models, "ChatOpenAI") as client:
+            self.assertIs(models.get_mimo(), client.return_value)
+            self.assertIs(models.get_mimo(), client.return_value)
+        client.assert_called_once_with(
+            model="mimo-v2.6-flash", api_key="test-key", base_url="https://api.xiaomimimo.com/v1",
+            temperature=0, extra_body={"thinking": {"type": "disabled"}}, timeout=120, max_retries=2,
+        )
+
     def test_fact_plan_keeps_original_and_rewrite_and_splits_comparison(self):
-        """单事实保留原问和术语改写；比较题仍保留各项事实。"""
+        """原问保留，比较题分路；判断题的中性短语沿用相同检索接口。"""
         with patch.object(generate, "get_mimo") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.side_effect = [
                 generate.SearchPlan(queries=["rewritten simple question"]),
                 generate.SearchPlan(queries=["global average PUE", "GPT-3 facility PUE"]),
+                generate.SearchPlan(queries=["accelerator lifetime footprint embodied and operational impacts"]),
             ]
             self.assertEqual(generate.plan_queries("simple question"),
                              ["simple question", "rewritten simple question"])
             self.assertEqual(generate.plan_queries("compare the two PUE values"),
                              ["compare the two PUE values", "global average PUE", "GPT-3 facility PUE"])
+            # 判断题仍保留完整命题，中性查询不依赖答案或标准来源。
+            claim = "True or False: running energy covers the accelerator lifetime footprint."
+            self.assertEqual(generate.plan_queries(claim),
+                             [claim, "accelerator lifetime footprint embodied and operational impacts"])
+            self.assertEqual(model.invoke.call_args.args[0][1].content, claim)
 
     def test_single_query_rewrite_deduplicates_and_empty_plan_falls_back(self):
         """相同改写不重复检索，空规划仍使用原问题。"""
@@ -522,6 +543,78 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(draft.answer_value, 42)
         self.assertEqual(draft.supports, [])
 
+    def test_explicit_corroboration_is_removed_without_first_source_bias(self):
+        """只移除明确旁证，关键证明位于第二条时仍保留，答案不改变。"""
+        evidence = [{"evidence_id": key, "ref_id": key, "pages": [1],
+                     "content": quote, "image_paths": []}
+                    for key, quote in (("review", "A model lifecycle includes manufacturing and operation."),
+                                       ("hardware", "Hardware manufacturing impacts are amortized over its lifetime."))]
+        # 标记与输出引用来自同一次生成，不额外调用模型或按题号筛选。
+        draft = generate.AnswerDraft(answer_value="0", supports=[
+            {"evidence_id": item["evidence_id"], "quote": item["content"],
+             "required": item["ref_id"] == "hardware"} for item in evidence]).model_dump()
+        result = generate.verify_supports(draft, evidence)
+        self.assertEqual(result["answer_value"], "0")
+        self.assertEqual(result["ref_ids"], ["hardware"])
+        self.assertNotIn("model lifecycle", result["supporting_materials"])
+
+    def test_multiple_required_sources_have_no_single_citation_limit(self):
+        """不同必需事实可来自多篇论文，精简规则不限制引用数量。"""
+        evidence = [{"evidence_id": key, "ref_id": key, "pages": [1],
+                     "content": f"The original study reports the measured property of device {key}.",
+                     "image_paths": []} for key in ("a", "b")]
+        draft = generate.AnswerDraft(answer_value="(a, b)", supports=[
+            {"evidence_id": item["evidence_id"], "quote": item["content"], "required": True}
+            for item in evidence]).model_dump()
+        self.assertEqual(generate.verify_supports(draft, evidence)["ref_ids"], ["a", "b"])
+
+    def test_calculation_sources_override_corroboration_flag(self):
+        """操作数标签经引文修正后仍保护来源，即使被误标成旁证也不删。"""
+        evidence = [{"evidence_id": f"{key}:text", "ref_id": key, "pages": [1],
+                     "content": f"The measured energy for experiment {key} is {value} kWh.",
+                     "image_paths": []} for key, value in (("a", 20), ("b", 10))]
+        # 第一项故意挂错标签，检验保护在原有归属修正之后执行。
+        draft = generate.AnswerDraft(answer_value="2", calculation="v1 / v2",
+            supports=[{"evidence_id": "wrong", "quote": evidence[0]["content"], "required": False},
+                      {"evidence_id": "b:text", "quote": evidence[1]["content"], "required": True}],
+            numeric_facts=[generate.NumericFact(value=value, unit="kWh", conditions="matching operand",
+                evidence_id=key, matches_question=True) for key, value in (("wrong", 20), ("b:text", 10))]).model_dump()
+        with self.assertLogs(generate.logger):
+            result = generate.verify_supports(draft, evidence)
+        self.assertEqual(result["numeric_facts"][0]["evidence_id"], "a:text")
+        self.assertEqual(result["ref_ids"], ["a", "b"])
+        self.assertEqual(generate.verify_numeric_answer(result, evidence, "multiplier")["answer_value"], "2")
+
+    def test_all_corroboration_or_unknown_operand_keeps_verified_sources(self):
+        """全部标成旁证或操作数归属不明时保守回退，保留已有正确值。"""
+        record = {"evidence_id": "a:text", "ref_id": "a", "pages": [1],
+                  "content": "The measured total energy is 20 kWh.", "image_paths": []}
+        for source in (None, "unknown", "a"):
+            with self.subTest(source=source):
+                facts = [] if source is None else [generate.NumericFact(value=20, unit="kWh",
+                    conditions="matching operand", evidence_id=source, matches_question=True)]
+                draft = generate.AnswerDraft(answer_value=20, numeric_facts=facts,
+                    supports=[{"evidence_id": "a:text", "quote": record["content"], "required": False}]).model_dump()
+                if source == "a":
+                    result = generate.verify_supports(draft, [record])
+                else:
+                    with self.assertLogs(generate.logger):
+                        result = generate.verify_supports(draft, [record])
+                self.assertEqual(result["ref_ids"], ["a"])
+                self.assertEqual(result["answer_value"], 20)
+
+    def test_missing_or_invalid_required_flag_preserves_support(self):
+        """旧草稿默认保留引用，损坏布尔标记不使支持材料被跳过。"""
+        quote = "Hardware production contributes to its lifetime environmental footprint."
+        self.assertTrue(generate.EvidenceSupport(evidence_id="a", quote=quote).required)
+        for flag in (None, 0, "false", [], {}):
+            with self.subTest(flag=flag), self.assertLogs(generate.logger):
+                draft = generate.AnswerDraft(answer_value="0", supports=[
+                    {"evidence_id": "a", "quote": quote, "required": flag}])
+            self.assertTrue(draft.supports[0].required)
+            self.assertEqual(len(draft.supports), 1)
+            self.assertEqual(draft.answer_value, "0")
+
     def test_entirely_unsupported_quote_clears_only_citation(self):
         """整组引文均不在原文中时清空引用，核心答案仍保留。"""
         record = {**document("text").metadata, "pages": [1], "image_paths": []}
@@ -856,6 +949,179 @@ class PipelineTests(unittest.TestCase):
                 rows = list(csv.DictReader(file))
             self.assertEqual([row["id"] for row in rows], ["q1", "q2", "q3"])
             self.assertEqual([row["answer_value"] for row in rows], ["q1", "q2", "q3"])
+
+
+class PredictionResumeTests(unittest.TestCase):
+    """使用临时文件和模拟回答检查逐题保存、失败跳过及续跑，不调用 API。"""
+
+    def setUp(self):
+        """隔离输入、进度和提交文件，并替换所有需要加载模型的入口。"""
+        # 所有读写限于临时目录，原有提交和索引不参与测试。
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.root / "input").mkdir()
+        (self.root / "input/metadata.csv").write_text("id,url\n", encoding="utf-8")
+        (self.root / "input/test_Q.csv").write_text(
+            "id,question,answer_unit,Cohort\nq1,first,percent,new\n"
+            "q2,second,percent,new\nq3,third,percent,new\n", encoding="utf-8"
+        )
+        self.output = self.root / "submissions/test_submission.csv"
+        self.output.parent.mkdir()
+        self.progress = self.output.with_suffix(".progress.jsonl")
+        self.failed = self.output.with_suffix(".failed.csv")
+        self.enterContext(patch.object(generate, "ROOT", self.root))
+        self.mimo = self.enterContext(patch.object(generate, "get_mimo"))
+        self.store = self.enterContext(patch.object(generate, "get_vector_store"))
+        self.reranker = self.enterContext(patch.object(generate, "get_reranker"))
+
+    def write_saved(self, rows):
+        """写入独立的成功记录，模拟上一轮已经完成的题目。"""
+        # JSONL 的行序允许与问题顺序不同，最终提交仍须按输入排序。
+        self.progress.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+
+    def questions(self):
+        """读取测试输入，供进度匹配和恢复检查使用。"""
+        # 不使用真实训练题或标准答案。
+        with (self.root / "input/test_Q.csv").open(encoding="utf-8", newline="") as file:
+            return list(csv.DictReader(file))
+
+    def test_content_filter_retries_once_and_system_error_is_not_retried(self):
+        """仅对内容过滤多尝试一次，配置或 API 故障仍立即向外抛出。"""
+        row = self.questions()[0]
+        expected = {**row, "answer_value": "42"}
+        with patch.object(generate, "answer_one", side_effect=[
+            generate.ContentFilterFinishReasonError(), expected
+        ]) as answer, self.assertLogs(generate.logger):
+            self.assertEqual(generate.answer_with_retry(row, {}), expected)
+            self.assertEqual(answer.call_count, 2)
+        with patch.object(generate, "answer_one", side_effect=ConnectionError("API unavailable")) as answer:
+            with self.assertRaises(ConnectionError):
+                generate.answer_with_retry(row, {})
+            answer.assert_called_once()
+
+    def test_filtered_question_is_skipped_and_resume_only_fills_missing_question(self):
+        """持续过滤首题时保存后续两题，第二轮仅补做失败题后导出完整提交。"""
+        self.output.write_text("previous complete submission", encoding="utf-8")
+
+        def fake_answer(row, _metadata):
+            """模拟首题内容过滤，其他题目正常返回，不依赖线程执行顺序。"""
+            if row["id"] == "q1":
+                raise generate.ContentFilterFinishReasonError()
+            return {**row, "answer_value": "42"}
+
+        with patch.object(generate, "answer_one", side_effect=fake_answer) as answer, self.assertLogs(generate.logger):
+            self.assertIsNone(generate.predict_all())
+        self.assertEqual(answer.call_count, 4)
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "previous complete submission")
+        with self.failed.open(encoding="utf-8", newline="") as file:
+            failures = list(csv.DictReader(file))
+        self.assertEqual([row["id"] for row in failures], ["q1"])
+        self.assertIn("content filter", failures[0]["error"])
+        saved = generate.read_progress(self.progress, self.questions())
+        self.assertEqual(set(saved), {"q2", "q3"})
+        self.assertTrue(all(row["answer_value"] == "42" for row in saved.values()))
+
+        # 补跑只提交未完成的 q1；失败列表清空，CSV 恢复完整输入顺序。
+        with patch.object(generate, "answer_one", side_effect=lambda row, _: {**row, "answer_value": "43"}) as answer:
+            self.assertEqual(generate.predict_all(), self.output)
+        answer.assert_called_once()
+        self.assertEqual(answer.call_args.args[0]["id"], "q1")
+        with self.output.open(encoding="utf-8", newline="") as file:
+            results = list(csv.DictReader(file))
+        self.assertEqual([row["id"] for row in results], ["q1", "q2", "q3"])
+        self.assertEqual([row["answer_value"] for row in results], ["43", "42", "42"])
+        with self.failed.open(encoding="utf-8", newline="") as file:
+            self.assertEqual(list(csv.DictReader(file)), [])
+
+    def test_all_saved_results_export_without_api_and_preserve_current_input(self):
+        """完整进度可直接导出；数值零、拒答和本轮 Cohort 都保持正确。"""
+        values = [0, "is_blank", "42"]
+        self.write_saved(list(reversed([
+            {**row, "answer_value": value, "Cohort": "old"}
+            for row, value in zip(self.questions(), values)
+        ])))
+        with patch.object(generate, "answer_one") as answer:
+            self.assertEqual(generate.predict_all(), self.output)
+        answer.assert_not_called()
+        self.mimo.assert_not_called()
+        self.store.assert_not_called()
+        self.reranker.assert_not_called()
+        with self.output.open(encoding="utf-8", newline="") as file:
+            results = list(csv.DictReader(file))
+        self.assertEqual([row["answer_value"] for row in results], ["0", "is_blank", "42"])
+        self.assertEqual([row["Cohort"] for row in results], ["new"] * 3)
+
+    def test_restart_predicts_all_and_replaces_only_progress_before_completion(self):
+        """显式重跑忽略已有答案；新进度不混入上一轮记录。"""
+        self.write_saved([{**row, "answer_value": "old"} for row in self.questions()])
+        with patch.object(generate, "answer_one", side_effect=lambda row, _: {**row, "answer_value": "new"}) as answer:
+            self.assertEqual(generate.predict_all(restart=True), self.output)
+        self.assertEqual(answer.call_count, 3)
+        records = [json.loads(line) for line in self.progress.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(records), 3)
+        self.assertTrue(all(row["answer_value"] == "new" for row in records))
+
+    def test_changed_question_unit_and_truncated_tail_are_recomputed(self):
+        """只恢复匹配的记录；损坏尾行不妨碍后续追加和再次恢复。"""
+        rows = self.questions()
+        self.write_saved([
+            {**rows[0], "answer_value": "0"},
+            {**rows[1], "question": "old question", "answer_value": "old"},
+            {**rows[2], "answer_unit": "watts", "answer_value": "old"},
+        ])
+        # 同时模拟 JSON 截断和 UTF-8 字节损坏，最后一行故意不带换行。
+        with self.progress.open("ab") as file:
+            file.write(b'{"id": "unfinished\n{"id": "\xff')
+        with patch.object(generate, "answer_one", side_effect=lambda row, _: {**row, "answer_value": "42"}) as answer, self.assertLogs(generate.logger):
+            self.assertEqual(generate.predict_all(), self.output)
+        self.assertEqual({call.args[0]["id"] for call in answer.call_args_list}, {"q2", "q3"})
+        with self.assertLogs(generate.logger):
+            saved = generate.read_progress(self.progress, rows)
+        self.assertEqual(set(saved), {"q1", "q2", "q3"})
+        self.assertEqual(saved["q1"]["answer_value"], "0")
+
+    def test_system_failure_keeps_written_progress_and_previous_submission(self):
+        """系统故障继续抛错；此前已保存的题目和原提交文件都不丢失。"""
+        self.output.write_text("previous complete submission", encoding="utf-8")
+
+        def fake_answer(row, _metadata):
+            """按题号注入系统故障，避免把错误当作 is_blank 缓存。"""
+            if row["id"] == "q2":
+                raise ConnectionError("API unavailable")
+            return {**row, "answer_value": "42"}
+
+        # 固定消费顺序，确保先验证 q1 落盘，再观察 q2 系统故障。
+        with patch.object(generate, "answer_one", side_effect=fake_answer), \
+             patch.object(generate, "as_completed", side_effect=lambda futures: iter(futures)):
+            with self.assertRaises(ConnectionError):
+                generate.predict_all()
+        self.assertEqual(set(generate.read_progress(self.progress, self.questions())), {"q1"})
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "previous complete submission")
+
+    def test_final_write_failure_preserves_previous_submission_and_full_progress(self):
+        """最终替换失败时保留原提交和全部进度，后续无需重新请求模型。"""
+        self.output.write_text("previous complete submission", encoding="utf-8")
+        with patch.object(generate, "answer_one", side_effect=lambda row, _: {**row, "answer_value": "42"}), \
+             patch.object(Path, "replace", side_effect=OSError("file locked")):
+            with self.assertRaises(OSError):
+                generate.predict_all()
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "previous complete submission")
+        self.assertEqual(len(generate.read_progress(self.progress, self.questions())), 3)
+
+    def test_cli_reports_incomplete_prediction_and_forwards_restart(self):
+        """存在未完成题目时入口退出为 1，不输出提交已保存的成功提示。"""
+        main = importlib.import_module("wattbot.main")
+        with patch.object(sys, "argv", ["wattbot", "predict", "--restart"]), \
+             patch.object(generate, "predict_all", return_value=None) as predict, \
+             patch("sys.stderr", new_callable=StringIO) as error, \
+             patch("sys.stdout", new_callable=StringIO) as output:
+            with self.assertRaises(SystemExit) as exit_info:
+                main.main()
+        self.assertEqual(exit_info.exception.code, 1)
+        predict.assert_called_once_with(None, None, restart=True)
+        self.assertIn("已保存成功结果", error.getvalue())
+        self.assertNotIn("提交文件已保存", output.getvalue())
 
 
 # 标准库 unittest 足够完成本次离线回归，不引入额外测试依赖。

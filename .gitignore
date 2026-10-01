@@ -6,3 +6,5 @@ __pycache__/
 /papers/
 /.idea/
 /artifacts/
+# 提交 CSV、备份和断点进度只在本地保存，不上传公开仓库。
+/submissions/

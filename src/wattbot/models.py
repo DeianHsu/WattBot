@@ -35,12 +35,13 @@ def get_mimo():
     if not api_key:
         raise RuntimeError("请在项目 .env 中设置 MIMO_API_KEY")
 
-    # 图片描述和最终答案共用一个模型，调用时分别传入不同提示词。
+    # 图片描述和最终答案共用一个模型；小样对照无答案回退，默认关闭深度思考。
     return ChatOpenAI(
         model="mimo-v2.6-flash",
         api_key=api_key,
         base_url="https://api.xiaomimimo.com/v1",
         temperature=0,
+        extra_body={"thinking": {"type": "disabled"}},
         timeout=120,
         max_retries=2,
     )

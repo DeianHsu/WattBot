@@ -20,6 +20,7 @@ def main():
     predict_parser = subparsers.add_parser("predict", help="生成比赛提交文件")
     predict_parser.add_argument("--input", help="问题 CSV 路径")
     predict_parser.add_argument("--output", help="提交 CSV 输出路径")
+    predict_parser.add_argument("--restart", action="store_true", help="忽略已有进度，重新预测全部问题")
     args = parser.parse_args()
 
     # 仅在执行对应命令时导入业务模块，查看帮助不会加载模型或调用 API。
@@ -28,7 +29,10 @@ def main():
         build_index(args.pdf)
     else:
         from wattbot.generate import predict_all
-        output_path = predict_all(args.input, args.output)
+        output_path = predict_all(args.input, args.output, restart=args.restart)
+        # 存在失败题目时明确退出，避免把仍保留的旧提交误当作本轮新结果。
+        if output_path is None:
+            parser.exit(1, "仍有未完成题目，已保存成功结果和失败列表；重跑同一命令继续。\n")
         print(f"提交文件已保存：{output_path}")
 
 

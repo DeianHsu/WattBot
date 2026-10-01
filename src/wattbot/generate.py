@@ -7,7 +7,7 @@ import logging
 import operator
 import re
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, DecimalException, localcontext
 from functools import partial
 from pathlib import Path
@@ -15,6 +15,7 @@ from threading import Lock
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.exceptions import OutputParserException
+from openai import ContentFilterFinishReasonError
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from wattbot.index import get_vector_store
@@ -45,11 +46,26 @@ class NumericFact(BaseModel):
 
 
 class EvidenceSupport(BaseModel):
-    """将支持材料绑定到一条原始证据，正文或表格使用逐字引文。"""
+    """将支持材料绑定到原始证据，并区分必需证明与重复旁证。"""
 
     evidence_id: str
     quote: str = ""
     visual_detail: str = ""
+    required: bool = Field(default=True, description=(
+        "True only when this is selected primary proof of a fact REQUIRED by the "
+        "question or a calculation operand. False for redundant corroboration or "
+        "optional background. Extra explanation details do not create required facts."
+    ))
+
+    @field_validator("required", mode="before")
+    @classmethod
+    def normalize_required(cls, value):
+        """标记缺失或损坏时保留引用，只允许明确的布尔 false 表示旁证。"""
+        # 不将字符串、数字或空值误解成删除来源的授权。
+        if isinstance(value, bool):
+            return value
+        logger.warning("支持材料的 required 标记异常，保留该来源")
+        return True
 
 
 class ChartReadings(BaseModel):
@@ -265,8 +281,25 @@ Rules:
    already-supported fact is unnecessary. Prefer the original study/report
    when its relevant passage is supplied; include a review only when the
    question asks for that review's statement or it supplies a missing fact.
-   First fill supports with ONLY passages/images actually needed for the answer.
-   Each support has evidence_id (copy its short E-label), quote and visual_detail.
+   For a true/false coverage claim, prefer one decisive passage about the
+   requested entity's scope or lifecycle. Keep supporting_materials focused
+   on that proof; do not add unrelated model examples or quantitative background.
+   Prefer direct hardware lifecycle accounting over a broad review's generic
+   model lifecycle example when the question concerns the hardware itself.
+   For a device lifetime claim, prefer a passage explicitly accounting for
+   that device's manufacturing over its hardware lifespan. An aggregate
+   AI/model/task carbon split is less direct evidence about that device's
+   lifetime boundary; do not use it in place of supplied hardware accounting.
+   For each fact REQUIRED by the question, select its most direct primary proof.
+   Mark those supports required=true. A second source repeating that same fact
+   is corroboration: omit it or mark required=false. Additional detail in your
+   explanation does not make a source required. Keep every distinct required
+   fact and calculation operand, even when multiple papers are needed.
+   ref_ids, supporting_materials and explanation must use only required proof,
+   not optional corroboration. Prefer direct entity-specific accounting for
+   the primary proof over generic examples that happen to reach the same answer.
+   Each support has evidence_id (copy its short E-label), quote, visual_detail
+   and required. Keep the explanation limited to facts needed for the question.
    For text/table content, copy a complete, contiguous exact quote from that
    SAME evidence block and leave visual_detail empty. Never combine a quote
    from one block with the label of another. For an attached image, leave quote
@@ -316,6 +349,12 @@ Rules:
    A supplied annual aggregate and its population count establish the annual
    per-member quantity directly. Prefer that to back-solving a daily illustrative
    equivalence with extra time conversions; use all operands' original sources.
+   Apply source-selection priorities ONLY after confirming all scope qualifiers.
+   For a reported statistic, prefer a passage directly naming the requested
+   metric and action over a related case-study intensity or proxy. Do not
+   silently replace it with another study's estimate because that study is newer.
+   If multiple estimates remain applicable, explain the chosen source and scope;
+   do not claim the literature provides a unique value.
 7. If evidence is insufficient, return answer="is_blank",
    answer_value="is_blank", ref_ids=[], supporting_materials="is_blank".
    explanation must explain what is missing.
@@ -379,23 +418,35 @@ Rules:
 
 
 def plan_queries(question):
-    """只根据题目规划检索；单事实保留原问并补充一条术语改写。"""
-    # 复用已有规划请求，改写仅补充标准术语，不增加事实、条件或答案。
+    """保留原问并规划简短事实查询；判断题使用中性的定义或范围查询。"""
+    # 保留每个操作数自己的指标和动作，防止改写迁移另一操作数的条件。
     prompt = (
-        "Return JSON with a queries array containing the MINIMUM independent "
-        "lookups explicitly needed by the question. If it asks for one reported "
-        "result or factor, return ONE query even if that result is a ratio. Split "
-        "only when values from distinct sources or contexts are explicitly needed "
-        "for a calculation or comparison. Each query must preserve the question's "
-        "exact entity, year, population, metric and conditions. Never add names, "
-        "years, examples, hardware or assumptions absent from the question; keep "
-        "unnamed entities unnamed. For a single lookup, rewrite it as a complete "
-        "search question using unambiguous technical terminology. Preserve the "
-        "requested statistic: floor/lowest means minimum, not mean. Include an "
-        "unambiguous technical synonym or standard metric acronym when it improves "
-        "retrieval. Keep ambiguous terms unchanged. Do not provide "
-        "answers, values or paper IDs. Use at most four queries. "
-        'Output only a JSON object in this shape: {"queries": ["full search question"]}.'
+        "Extract the MINIMUM independent facts needed to answer the question. "
+        "Return each lookup as a SHORT self-contained search PHRASE, not a full "
+        "question or an explanation. Start with the exact metric/entity phrase "
+        "and action copied from the question; preserve its year, population, "
+        "statistic and conditions. Keep unnamed entities unnamed. Do not add "
+        "source names, values, years, examples or assumptions. A qualifier of "
+        "another operand must not migrate into this lookup. For a numerical "
+        "comparison/calculation whose operands are already named, copy each "
+        "operand as ONE CONTIGUOUS phrase from the original question, in its "
+        "original word order. Retain an adjacent 'reported' qualifier. Do not "
+        "append generic search words such as 'reported value', move words, or "
+        "add synonyms; the full original question is already searched separately. "
+        "Split only when "
+        "distinct sources or contexts are needed for a comparison/calculation; "
+        "one already-reported result or factor needs ONE lookup. "
+        "For true/false and yes/no claims, search the metric's neutral definition "
+        "or accounting boundary, not a restatement of the assertion. For a "
+        "hardware lifetime footprint, use embodied/manufacturing and operational "
+        "environmental impacts as search terms; do not broaden it into the "
+        "stages of a generic AI/model lifecycle. Never assume the claim is true "
+        "or false. Keep footprint broader than carbon when the question does. "
+        "Use an unambiguous technical synonym only when needed; do not enumerate "
+        "possible answers or add parenthetical explanations. Floor/lowest means "
+        "minimum, not mean. Use at most four phrases of about eight to eighteen "
+        "words each, retaining longer explicit conditions when necessary. "
+        'Output only JSON: {"queries": ["short fact search phrase"]}.'
     )
     model = get_mimo().with_structured_output(SearchPlan, method="json_mode")
     try:
@@ -573,7 +624,7 @@ def verify_numeric_answer(draft, evidence, answer_unit, question=""):
 
 
 def verify_supports(draft, evidence):
-    """核对逐字引文的真实归属，引用从核验后的证据推导，不改核心答案。"""
+    """核对引文归属并移除明确旁证，保留操作数来源及核心答案。"""
     def normalize(text):
         """容忍 PDF 空格及 Unicode 字形差异，保留标点和数字。"""
         text = text.translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'}))
@@ -641,7 +692,8 @@ def verify_supports(draft, evidence):
         if source != record["evidence_id"]:
             logger.warning("支持引文来源已纠正：%s -> %s", source, record["evidence_id"])
         remaps.setdefault(source, set()).add(record["evidence_id"])
-        verified.append((record, quote or support["visual_detail"].strip()))
+        verified.append((record, quote or support["visual_detail"].strip(),
+                         support.get("required", True)))
         support["evidence_id"] = record["evidence_id"]
 
     # 未给核验记录时保持既有降级；明确给出但全被否定的材料不再当作有效引用。
@@ -650,16 +702,26 @@ def verify_supports(draft, evidence):
             draft["ref_ids"] = []
             draft["supporting_materials"] = "is_blank"
         return draft
-    draft["ref_ids"] = list(dict.fromkeys(record["ref_id"] for record, _ in verified))
-    draft["supporting_materials"] = "\n".join(
-        f"[{record['evidence_id']}; pages={record['pages']}] {text}"
-        for record, text in verified
-    )
     # 单一归属可同步修正数值记录；一条标签被混用于多个来源时不猜操作数来源。
     for fact in draft.get("numeric_facts", []):
         targets = remaps.get(fact["evidence_id"], set())
         if len(targets) == 1:
             fact["evidence_id"] = next(iter(targets))
+
+    # 只删明确旁证；操作数所在论文始终保留，不对引用篇数设置统一上限。
+    operands = {fact["evidence_id"] for fact in draft.get("numeric_facts", [])}
+    protected = {records[key]["ref_id"] if key in records else key for key in operands}
+    selected = [(record, text) for record, text, required in verified
+                if required is not False or record["ref_id"] in protected]
+    # 没有关键证明或无法确定操作数归属时不猜，继续保留已核验来源。
+    if not selected or operands - (records.keys() | {record["ref_id"] for record in evidence}):
+        logger.warning("必需证明或操作数来源不明确，跳过旁证精简")
+        selected = [(record, text) for record, text, _ in verified]
+    draft["ref_ids"] = list(dict.fromkeys(record["ref_id"] for record, _ in selected))
+    draft["supporting_materials"] = "\n".join(
+        f"[{record['evidence_id']}; pages={record['pages']}] {text}"
+        for record, text in selected
+    )
     return draft
 
 
@@ -802,6 +864,10 @@ def generate_answer(question: str, answer_unit: str, evidence, facts=None, visua
         "such a restricted operand unless the question requests that restriction. "
         "Calling a restricted subset a 'national average' does not remove its "
         "exclusion. Use a supplied whole-population input instead, or abstain. "
+        "Before selecting a national/overall operand, check its quoted passage "
+        "for 'excluding', 'except', 'without' or 'only'. A sector exclusion not "
+        "requested in the question is a scope mismatch: matches_question=false. "
+        "Near-exact metric wording does not override that exclusion. "
         "For a layer's capabilities, excluded contributions do not prove what "
         "it captures; request a positive description of the actual framework. "
         "A framework that estimates/model-calculates energy does not establish "
@@ -916,8 +982,41 @@ def answer_one(row, metadata_by_id):
     return submission_row
 
 
-def predict_all(input_path=None, output_path=None):
-    """并发预测后按输入顺序写出 CSV；系统级失败保留已有输出文件。"""
+def answer_with_retry(row, metadata_by_id):
+    """内容过滤仅重试一次；其他 API、配置和索引错误直接向外抛出。"""
+    # 不修改问题或绕过过滤；重新运行同一道题，第二次过滤由批量入口记录。
+    try:
+        return answer_one(row, metadata_by_id)
+    except ContentFilterFinishReasonError:
+        logger.warning("%s 触发内容过滤，重试一次", row["id"])
+        return answer_one(row, metadata_by_id)
+
+
+def read_progress(progress_path, rows):
+    """只恢复相同问题、相同单位的成功结果，不把旧提交文件当作进度。"""
+    # JSONL 每行独立；进程中断留下的不完整行跳过，其他成功记录仍可恢复。
+    saved = {}
+    if progress_path.exists():
+        with progress_path.open("rb") as file:
+            for number, line in enumerate(file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    logger.warning("进度文件第 %d 行不完整，跳过该行", number)
+                    continue
+                if isinstance(record, dict) and record.get("id") and record.get("answer_value") not in (None, ""):
+                    saved[record["id"]] = record
+    # 输入内容发生变化的题目重新预测；模型、提示词变化时由 --restart 明确重跑。
+    return {row["id"]: saved[row["id"]] for row in rows
+            if row["id"] in saved
+            and saved[row["id"]].get("question") == row["question"]
+            and saved[row["id"]].get("answer_unit", "") == row.get("answer_unit", "")}
+
+
+def predict_all(input_path=None, output_path=None, *, restart=False):
+    """逐题保存成功结果，局部内容过滤跳过；全量成功后按输入顺序导出。"""
     # 所有默认路径相对项目根目录；可指定其他问题文件用于后续小范围运行。
     input_path = Path(input_path) if input_path else ROOT / "input/test_Q.csv"
     output_path = (
@@ -932,33 +1031,72 @@ def predict_all(input_path=None, output_path=None):
         rows = list(reader)
 
     # 即使问题文件未预留答案列，也补齐固定输出字段，避免写出时丢失答案。
-    for name in (
+    answer_fields = (
         "answer", "answer_value", "ref_id", "ref_url",
         "supporting_materials", "explanation",
-    ):
+    )
+    for name in answer_fields:
         if name not in fieldnames:
             fieldnames.append(name)
 
-    # 先加载共享客户端和本地模型，避免多个工作线程重复初始化 GPU 模型。
-    if rows:
+    # 每个输出路径拥有独立进度；旧版未落盘的结果无法恢复，也不复用旧提交。
+    progress_path = output_path.with_suffix(".progress.jsonl")
+    failed_path = output_path.with_suffix(".failed.csv")
+    predictions = {} if restart else read_progress(progress_path, rows)
+    pending = [row for row in rows if row["id"] not in predictions]
+    print(f"已恢复 {len(predictions)}/{len(rows)} 题；本轮待处理 {len(pending)} 题", flush=True)
+
+    # 只在有待预测题目时加载共享模型；所有结果已缓存时可直接导出，不调用 API。
+    if pending:
         get_mimo()
         get_vector_store()
         get_reranker()
 
-    # 最多同时处理三题；map 保持输入顺序，有限缓冲避免故障后排队过多 API 请求。
-    # 全部成功后才写文件，任一系统级错误不会覆盖已有提交结果。
-    predictions = []
-    with ThreadPoolExecutor(max_workers=PREDICT_WORKERS) as pool:
-        results = pool.map(partial(answer_one, metadata_by_id=metadata_by_id), rows,
-                           buffersize=PREDICT_WORKERS * 2)
-        for number, (row, prediction) in enumerate(zip(rows, results), start=1):
-            predictions.append(prediction)
-            print(f"已完成 {number}/{len(rows)}：{row['id']}", flush=True)
-
-    # 全部生成成功后一次写出比赛要求的 CSV。
+    # 成功一题就写入并 flush；补一个换行，避免历史不完整尾行粘住新记录。
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8", newline="") as file:
+    with progress_path.open("w" if restart else "a", encoding="utf-8") as progress, \
+         failed_path.open("w", encoding="utf-8", newline="") as failed:
+        progress.write("\n")
+        progress.flush()
+        failures = csv.DictWriter(failed, fieldnames=["id", "question", "error"])
+        failures.writeheader()
+        failed.flush()
+        # 按实际完成顺序保存，慢题或失败题不会挡住其他题落盘；最终 CSV 单独排序。
+        with ThreadPoolExecutor(max_workers=PREDICT_WORKERS) as pool:
+            futures = {pool.submit(answer_with_retry, row, metadata_by_id): row for row in pending}
+            try:
+                for future in as_completed(futures):
+                    row = futures[future]
+                    try:
+                        prediction = future.result()
+                    except ContentFilterFinishReasonError as exc:
+                        failures.writerow({"id": row["id"], "question": row["question"], "error": str(exc)})
+                        failed.flush()
+                        logger.warning("%s 再次触发内容过滤，记录失败并继续后续题目", row["id"])
+                        continue
+                    progress.write(json.dumps(prediction, ensure_ascii=False) + "\n")
+                    progress.flush()
+                    predictions[row["id"]] = prediction
+                    print(f"已完成 {len(predictions)}/{len(rows)}：{row['id']}", flush=True)
+            finally:
+                # 系统级错误仍向外抛出，取消尚未执行的题目，保留已落盘结果。
+                for future in futures:
+                    future.cancel()
+
+    # API 失败不等同于证据不足；缺题时不伪造 is_blank，也不覆盖完整提交。
+    if len(predictions) != len(rows):
+        logger.warning("仍有 %d 题未完成，原提交文件保持不变；进度：%s；失败题：%s",
+                       len(rows) - len(predictions), progress_path, failed_path)
+        return None
+
+    # 全量成功后先写临时文件，再替换最终 CSV，避免写入中断破坏已有提交。
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(predictions)
+        # 恢复时也只覆盖答案列，Cohort 等输入字段仍使用本轮文件中的值。
+        for row in rows:
+            result = predictions[row["id"]]
+            writer.writerow({**row, **{name: result.get(name, "") for name in answer_fields}})
+    temporary_path.replace(output_path)
     return output_path
