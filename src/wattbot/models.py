@@ -48,6 +48,39 @@ def get_mimo():
 
 
 @lru_cache(maxsize=1)
+def get_deepseek():
+    """获取 DeepSeek 多模态客户端；缓存客户端对象，不缓存问题或答案。"""
+    # 仅在选择 DeepSeek 时读取密钥，不要求同时配置两个供应商。
+    load_dotenv(ROOT / ".env")
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("请在项目 .env 中设置 DEEPSEEK_API_KEY")
+
+    # 图片描述和问答共用原生多模态模型；沿用关闭思考和网络超时设置。
+    return ChatOpenAI(
+        model="deepseek-flash",
+        api_key=api_key,
+        base_url="https://api.deepseek.com",
+        temperature=0,
+        extra_body={"thinking": {"type": "disabled"}},
+        timeout=120,
+        max_retries=2,
+    )
+
+
+def get_llm():
+    """统一选择生成模型；未指定供应商时沿用 MiMo。"""
+    # 先读取配置，客户端缓存由各供应商函数负责。
+    load_dotenv(ROOT / ".env")
+    provider = os.getenv("LLM_PROVIDER", "mimo").strip().lower()
+    if provider == "mimo":
+        return get_mimo()
+    if provider == "deepseek":
+        return get_deepseek()
+    raise ValueError(f"不支持的 LLM_PROVIDER：{provider}；可选 mimo 或 deepseek")
+
+
+@lru_cache(maxsize=1)
 def get_embeddings():
     """加载文本向量模型，用于正文、表格文本、图片描述和问题。"""
     # 建库和问题检索共用 GPU 向量模型；CUDA 不可用时立即报错，避免隐式退回 CPU。
@@ -78,7 +111,7 @@ def get_reranker():
 
 
 def image_block(image_path):
-    """读取本地 PNG，转换为 MiMo 可以接收的图片消息。"""
+    """读取本地 PNG，转换为生成模型可以接收的图片消息。"""
     # 原图通过 Base64 发送；只传本地路径不能让远程模型看到图片。
     try:
         data = (ROOT / image_path).read_bytes()

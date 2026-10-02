@@ -39,6 +39,8 @@ class PipelineTests(unittest.TestCase):
     def setUp(self):
         """生产问答的模拟测试不读取真实论文，页级补充另行测试。"""
         self.enterContext(patch.object(generate, "expand_pages", side_effect=lambda evidence, question="": evidence))
+        # 未显式替换的 ingestion 模型调用立即失败，防止离线测试误发真实请求。
+        self.enterContext(patch.object(ingest, "get_llm", side_effect=AssertionError("离线测试禁止调用真实 API")))
 
     def test_mimo_defaults_to_non_thinking_without_changing_model_or_timeouts(self):
         """默认关闭思考，模型、密钥读取和网络设置保持不变；不调用 API。"""
@@ -54,9 +56,57 @@ class PipelineTests(unittest.TestCase):
             temperature=0, extra_body={"thinking": {"type": "disabled"}}, timeout=120, max_retries=2,
         )
 
+    def test_deepseek_client_uses_vision_model_and_is_cached(self):
+        """DeepSeek 使用原生多模态模型并复用客户端，不调用 API。"""
+        # 清除缓存，使用模拟密钥检查参数，避免读取真实配置。
+        models.get_deepseek.cache_clear()
+        self.addCleanup(models.get_deepseek.cache_clear)
+        with patch.object(models, "load_dotenv"), patch.object(models.os, "getenv", return_value="test-key"), \
+             patch.object(models, "ChatOpenAI") as client:
+            self.assertIs(models.get_deepseek(), client.return_value)
+            self.assertIs(models.get_deepseek(), client.return_value)
+        client.assert_called_once_with(
+            model="deepseek-flash", api_key="test-key", base_url="https://api.deepseek.com",
+            temperature=0, extra_body={"thinking": {"type": "disabled"}}, timeout=120, max_retries=2,
+        )
+
+    def test_deepseek_missing_key_stops_before_creating_client(self):
+        """缺少 DeepSeek 密钥时明确报错，不发起网络请求。"""
+        # 空密钥属于配置问题，保留系统级错误提示。
+        models.get_deepseek.cache_clear()
+        self.addCleanup(models.get_deepseek.cache_clear)
+        with patch.object(models, "load_dotenv"), patch.object(models.os, "getenv", return_value=""), \
+             patch.object(models, "ChatOpenAI") as client:
+            with self.assertRaisesRegex(RuntimeError, "DEEPSEEK_API_KEY"):
+                models.get_deepseek()
+        client.assert_not_called()
+
+    def test_llm_routes_only_to_selected_provider(self):
+        """默认使用 MiMo；切换供应商时只构造对应客户端。"""
+        # 模拟未配置、显式选择和大小写输入，不读取真实密钥。
+        for provider, selected in ((None, "mimo"), ("mimo", "mimo"), (" DEEPSEEK ", "deepseek")):
+            with self.subTest(provider=provider), patch.object(models, "load_dotenv") as load, \
+                 patch.object(models.os, "getenv", side_effect=lambda name, default=None: default if provider is None else provider), \
+                 patch.object(models, "get_mimo") as mimo, patch.object(models, "get_deepseek") as deepseek:
+                clients = {"mimo": mimo, "deepseek": deepseek}
+                self.assertIs(models.get_llm(), clients[selected].return_value)
+                load.assert_called_once_with(models.ROOT / ".env")
+                clients[selected].assert_called_once_with()
+                clients["deepseek" if selected == "mimo" else "mimo"].assert_not_called()
+
+    def test_llm_rejects_unknown_provider(self):
+        """未知供应商直接报错，避免悄悄调用另一模型。"""
+        # 配置拼写错误时不创建任何客户端。
+        with patch.object(models, "load_dotenv"), patch.object(models.os, "getenv", return_value="unknown"), \
+             patch.object(models, "get_mimo") as mimo, patch.object(models, "get_deepseek") as deepseek:
+            with self.assertRaisesRegex(ValueError, "LLM_PROVIDER"):
+                models.get_llm()
+        mimo.assert_not_called()
+        deepseek.assert_not_called()
+
     def test_fact_plan_keeps_original_and_rewrite_and_splits_comparison(self):
         """原问保留，比较题分路；判断题的中性短语沿用相同检索接口。"""
-        with patch.object(generate, "get_mimo") as mimo:
+        with patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.side_effect = [
                 generate.SearchPlan(queries=["rewritten simple question"]),
@@ -75,7 +125,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_single_query_rewrite_deduplicates_and_empty_plan_falls_back(self):
         """相同改写不重复检索，空规划仍使用原问题。"""
-        with patch.object(generate, "get_mimo") as mimo:
+        with patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.side_effect = [
                 generate.SearchPlan(queries=[" question ", "question"]),
@@ -84,9 +134,34 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(generate.plan_queries("question"), ["question"])
             self.assertEqual(generate.plan_queries("question"), ["question"])
 
+    def test_fact_plan_keeps_original_and_bounds_technical_aliases(self):
+        """术语改写继续保留原问和独立事实，最多四条短查询，不扩大检索预算。"""
+        # 模拟模型规划，只检查查询结构，不将预期答案或来源注入生产提示。
+        phrases = ["reported site intensity", "national average generation intensity",
+                   "technical alias", "another fact", "excess query", "technical alias"]
+        with patch.object(generate, "invoke_json", return_value=generate.SearchPlan(queries=phrases)) as invoke:
+            result = generate.plan_queries("question")
+        self.assertEqual(result, ["question", *phrases[:4]])
+        prompt = invoke.call_args.args[1][0].content
+        self.assertIn("SAME meaning and scope", prompt)
+        self.assertIn("ALL independent facts", prompt)
+
+    def test_generation_contract_retains_all_inputs_and_exact_scopes(self):
+        """整题计算及范围约束交给模型，程序不会拆操作数或覆盖模型答案。"""
+        # 单位与完整原文仍进入同一生成请求，最终值保持模型选择。
+        record = {**document("text").metadata, "pages": [1], "image_paths": [],
+                  "content": "The annual measured electricity is 12 MWh; population: all facilities."}
+        with patch.object(generate, "invoke_json", return_value=generate.AnswerDraft(answer_value=999)) as invoke:
+            result = generate.generate_answer("Combine the requested quantities", "kWh", [record])
+        messages = invoke.call_args.args[1]
+        self.assertIn("cannot represent an unrestricted", messages[0].content)
+        self.assertIn(record["content"], str(messages[1].content))
+        self.assertIn("ALL requested inputs", messages[1].content[-1]["text"])
+        self.assertEqual(result["answer_value"], 999)
+
     def test_fact_plan_parser_fallback_but_api_error_raises(self):
         """规划格式异常只回退检索问题，真实 API 故障仍中止。"""
-        with patch.object(generate, "get_mimo") as mimo:
+        with patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.side_effect = OutputParserException("invalid JSON")
             with self.assertLogs(generate.logger):
@@ -176,10 +251,11 @@ class PipelineTests(unittest.TestCase):
         draft = generate.AnswerDraft(answer_value="is_blank", missing_queries=[{"query": "cluster GPU count", "ref_id": "paper"}]).model_dump()
         final = generate.AnswerDraft(answer_value=13, answer="13 days", ref_ids=["paper"],
             supporting_materials="actual quote", explanation="division", missing_queries=draft["missing_queries"]).model_dump()
-        with patch.object(generate, "plan_queries", return_value=["question"]), patch.object(generate, "retrieve_facts", side_effect=[[first], [second]]) as fetch, patch.object(generate, "generate_answer", side_effect=[draft, final]) as answer:
+        with patch.object(generate, "plan_queries", side_effect=[["question"], ["cluster GPU count"]]) as plan, patch.object(generate, "retrieve_facts", side_effect=[[first], [second]]) as fetch, patch.object(generate, "generate_answer", side_effect=[draft, final]) as answer:
             result = generate.answer_one({"id": "q", "question": "question"}, {"paper": {"url": "https://example.com"}})
         self.assertEqual(fetch.call_count, 2)
         fetch.assert_called_with(["cluster GPU count"], ["paper"])
+        plan.assert_called_with("cluster GPU count", "paper")
         self.assertEqual({e["evidence_id"] for e in answer.call_args.args[2]}, {"first", "second"})
         self.assertEqual(result["answer_value"], "13")
         self.assertNotIn("missing_queries", result)
@@ -193,6 +269,16 @@ class PipelineTests(unittest.TestCase):
         with patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[document("text").metadata]) as fetch, patch.object(generate, "generate_answer", return_value=draft), self.assertLogs(generate.logger):
             self.assertEqual(generate.answer_one({"id": "q", "question": "q"}, {})["answer_value"], "42")
         self.assertEqual(fetch.call_count, 1)
+
+    def test_scoped_lookup_omits_original_entity_query(self):
+        """论文内补查只使用模型改写的缺失事实，原模型名查询不再次参与重排。"""
+        with patch.object(generate, "get_llm") as llm:
+            llm.return_value.with_structured_output.return_value.invoke.return_value = generate.SearchPlan(
+                queries=["number of GPUs for pretraining", "training infrastructure GPU count", "unnecessary third query"])
+            result = generate.plan_queries("number of GPUs trained Model-X", "paper")
+        self.assertEqual(result, ["number of GPUs for pretraining", "training infrastructure GPU count"])
+        prompt = llm.return_value.with_structured_output.return_value.invoke.call_args.args[0][0].content
+        self.assertIn("ALREADY identified", prompt)
 
     def test_keyword_candidate_enters_reranking(self):
         """关键词找到的新证据与向量候选一起重排。"""
@@ -253,7 +339,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_empty_description_falls_back_but_api_failure_raises(self):
         """空描述回退图题，API 故障不被当成空描述。"""
-        with patch.object(Path, "exists", return_value=False), patch.object(ingest, "image_block", return_value={"type": "image_url"}), patch.object(ingest, "get_mimo") as mimo:
+        with patch.object(Path, "exists", return_value=False), patch.object(ingest, "image_block", return_value={"type": "image_url"}), patch.object(ingest, "get_llm") as mimo:
             mimo.return_value.invoke.return_value.text = ""
             with self.assertLogs(ingest.logger):
                 self.assertEqual(ingest.describe_picture(["x.png"], "caption"), "caption")
@@ -263,7 +349,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_parser_failure_falls_back_but_api_failure_raises(self):
         """回答格式异常允许拒答，连接或配置错误仍中止。"""
-        with patch.object(generate, "get_mimo") as mimo:
+        with patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.side_effect = OutputParserException("invalid JSON")
             with self.assertLogs(generate.logger):
@@ -344,79 +430,57 @@ class PipelineTests(unittest.TestCase):
                     row = generate.answer_one({"id": "q", "question": "q"}, {})
                 self.assertEqual(row["answer_value"], value)
 
-    def test_decimal_calculation_and_unit_conversion(self):
-        """十进制加法、比值和单位转换保留精度，不依赖模型心算。"""
-        self.assertEqual(generate.calculate("v1 + v2", ["0.1", "0.2"]), "0.3")
-        self.assertEqual(generate.calculate("(v1 - v2) * 1000", ["1.2", "0.3"]), "900")
-        self.assertEqual(generate.calculate("-v1 / +v2", ["3", "2"]), "-1.5")
-        self.assertTrue(generate.calculate("v1 / v2", ["1.58", "1.10"]).startswith("1.4363636363"))
-        for expression in ("v1 ** 2", "round(v1)", "v2 + 1", "v1.real", "1 + 2"):
-            with self.subTest(expression=expression), self.assertRaises(ValueError):
-                generate.calculate(expression, ["3"])
-
-    def test_verified_calculation_updates_answer_and_explanation(self):
-        """复算结果同时更新答案和说明，内部数值字段不进入提交。"""
-        fact = generate.NumericFact(value="1.25", unit="kWh", conditions="measured task total",
-                                    evidence_id="text", matches_question=True)
-        draft = generate.AnswerDraft(answer_value="1249", numeric_facts=[fact],
-                                     calculation="v1 * 1000", ref_ids=["paper"]).model_dump()
+    def test_calculation_preserves_model_answer_and_explanation(self):
+        """计算结果与说明直接沿用模型输出，不输出旧数值审核字段。"""
+        draft = generate.AnswerDraft(answer_value="1249", answer="1249 Wh",
+                    explanation="Model calculation.", calculation="v1 * 1000",
+                    numeric_facts=[{"value": 1.25}], ref_ids=["paper"]).model_dump()
         record = {**document("text").metadata, "pages": [1], "image_paths": []}
-        result = generate.verify_numeric_answer(draft, [record], "Wh")
-        self.assertEqual(result["answer_value"], "1250")
-        self.assertEqual(result["answer"], "1250 Wh")
-        self.assertIn("v1 * 1000 = 1250 Wh", result["explanation"])
-        with patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "generate_answer", return_value=result), self.assertLogs(generate.logger):
+        with patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "generate_answer", return_value=draft), self.assertLogs(generate.logger):
             row = generate.answer_one({"id": "q", "question": "q"}, {"paper": {"url": "https://example.com"}})
-        self.assertNotIn("numeric_facts", row)
-        self.assertNotIn("calculation", row)
+        self.assertEqual(row["answer_value"], "1249")
+        self.assertEqual(row["explanation"], "Model calculation.")
+        self.assertNotIn("numeric_facts", draft)
+        self.assertNotIn("calculation", draft)
 
-    def test_ratio_and_estimated_duration_round_only_final_result(self):
-        """比值与估算时长格式稳定，精确计数和中间复算精度不被截断。"""
-        for values, expression, unit, question, expected in (
-            (("0.020", "0.015"), "v1 / v2", "multiplier", "By what factor?", "1.33"),
-            (("30000", "96"), "v1 / (v2 * 24)", "days", "Estimate the duration", "13.0"),
-            (("30000", "96"), "v1 / (v2 * 24)", "days", "Exact duration", "13.02083333333333333333333333"),
-            (("204592592",), "v1", "inferences", "Approximately how many?", "204592592"),
-        ):
-            facts = [generate.NumericFact(value=value, unit="source units", conditions="matching operand",
-                evidence_id="text", matches_question=True) for value in values]
-            draft = generate.AnswerDraft(answer_value=1, numeric_facts=facts, calculation=expression).model_dump()
-            result = generate.verify_numeric_answer(draft, [document("text").metadata], unit, question)
-            self.assertEqual(result["answer_value"], expected)
-            self.assertIn(generate.calculate(expression, values), result["explanation"])
+    def test_calculation_preserves_model_precision(self):
+        """倍率、估算时长和计数的精度全部由模型输出决定。"""
+        for value in ("1.3333333333333333", "13.02083333333333333333333333", "204592592"):
+            with self.subTest(value=value):
+                draft = generate.AnswerDraft(answer_value=value).model_dump()
+                self.assertEqual(generate.normalize_answer_value(draft["answer_value"]), value)
 
-    def test_mismatched_required_quantity_abstains(self):
-        """模型明确认定所选均值不满足最小值条件时，不继续拿它计算。"""
-        fact = generate.NumericFact(value="0.7", unit="g", conditions="mean, not minimum",
-                                    evidence_id="text", matches_question=False)
-        draft = generate.AnswerDraft(answer_value="0.7", numeric_facts=[fact]).model_dump()
-        result = generate.verify_numeric_answer(draft, [document("text").metadata], "g")
-        self.assertEqual(result["answer_value"], "is_blank")
-        self.assertIn("mean, not minimum", result["explanation"])
+    def test_incomplete_formula_does_not_override_correct_model_value(self):
+        """旧输出的算式漏写换算时，程序仍保留模型的最终数值和说明。"""
+        draft = generate.AnswerDraft(answer_value="52920", answer="52920 liters",
+            explanation="700000000 * 0.42 / 1000 * 0.18 = 52920 liters.",
+            calculation="v1 * v2 * v3").model_dump()
+        self.assertEqual(draft["answer_value"], "52920")
+        self.assertNotIn("calculation", draft)
 
-    def test_direct_number_converts_scale_once(self):
-        """直取值换算百万升／十亿美元，已转换值和不同维度保持不变。"""
-        record = document("text").metadata
-        for value, source, target, answer, expected in (
-            (5.4, "million liters", "liters", "5.4", "5400000.0"),
-            (5.6, "billion USD", "USD", "5.6", "5600000000.0"),
-            (5.4, "million liters", "liters", "5400000", "5400000"),
-            (5.4, "million liters", "USD", "5.4", "5.4"),
-            (1892, "million gallons per day", "billion gallons per day", "1892", "1.892"),
-        ):
-            with self.subTest(source=source, target=target, answer=answer):
-                fact = generate.NumericFact(value=value, unit=source, conditions="reported total",
-                                            evidence_id="text", matches_question=True)
-                draft = generate.AnswerDraft(answer_value=answer, numeric_facts=[fact]).model_dump()
-                self.assertEqual(generate.verify_numeric_answer(draft, [record], target)["answer_value"], expected)
+    def test_numeric_condition_flag_does_not_override_final_answer(self):
+        """旧的数值条件标记不触发程序拒答，最终核心答案保持原样。"""
+        record = {**document("text").metadata, "pages": [1], "image_paths": []}
+        draft = generate.AnswerDraft(answer_value="0.7",
+            numeric_facts=[{"value": "0.7", "matches_question": False}])
+        with patch.object(generate, "get_llm") as llm:
+            llm.return_value.with_structured_output.return_value.invoke.return_value = draft
+            result = generate.generate_answer("What minimum?", "g", [record])
+        self.assertEqual(result["answer_value"], "0.7")
+        self.assertNotIn("numeric_facts", result)
+
+    def test_direct_number_preserves_model_unit_conversion(self):
+        """数量级换算交给模型；程序不执行乘法，也不核对结果是否正确。"""
+        for value in ("5.4", "5400000", "1892"):
+            self.assertEqual(generate.normalize_answer_value(value), value)
 
     def test_unused_mismatched_candidate_preserves_selected_value(self):
-        """申请量与批准量同时出现时，已舍弃的申请量不清空批准量答案。"""
-        facts = [generate.NumericFact(value=value, unit="volume", conditions=condition,
-                    evidence_id="text", matches_question=matches)
-                 for value, condition, matches in ((10.1, "requested volume", False), (8.2, "approved volume", True))]
-        draft = generate.AnswerDraft(answer_value="8.2", numeric_facts=facts).model_dump()
-        self.assertEqual(generate.verify_numeric_answer(draft, [document("text").metadata], "volume")["answer_value"], "8.2")
+        """未使用的候选条件不会干扰最终模型答案。"""
+        draft = generate.AnswerDraft(answer_value="8.2",
+            numeric_facts=[{"value": 10.1, "matches_question": False},
+                           {"value": 8.2, "matches_question": True}]).model_dump()
+        self.assertEqual(draft["answer_value"], "8.2")
+        self.assertNotIn("numeric_facts", draft)
 
     def test_collection_formats_and_non_collection_values(self):
         """范围和数组整理为比赛格式，模型名称、负数及千位逗号不误改。"""
@@ -430,51 +494,35 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 generate.AnswerDraft(answer_value=value)
 
-    def test_category_and_source_term_normalization(self):
-        """只规范缩放标签并补回明确命名的术语，含糊或不匹配术语不改写。"""
-        self.assertEqual(generate.normalize_answer_value("sublinearly", "Does energy scale linearly or sublinearly?"), "sublinear")
-        self.assertEqual(generate.normalize_answer_value("GPT-4 and Claude-3.5", "Which two frontier models?"), "(GPT-4, Claude-3.5)")
-        self.assertEqual(generate.normalize_answer_value("(node, system)", "Which two additional levels?"), "node and system")
-        self.assertEqual(generate.normalize_answer_value("node-level and system-level", "Which two additional levels?"), "node and system")
-        self.assertEqual(generate.normalize_answer_value("(prefill, decode)", "What are those two stages?"), "prefill and decode")
-        self.assertEqual(generate.normalize_answer_value("(prompt prefill, autoregressive decode)", "What are those two stages?"), "prefill and decode")
-        self.assertEqual(generate.normalize_answer_value("prompt prefill", "Which model?"), "prompt prefill")
-        self.assertEqual(generate.normalize_answer_value("(1, 2)", "Which scopes?"), "(1, 2)")
-        support = "This rebound is also known as a real income effect because spending rises."
-        self.assertEqual(generate.normalize_answer_value("income effect", "What economic term is it known by?", support), "real income effect")
-        self.assertEqual(generate.normalize_answer_value("another effect", "What term?", support), "another effect")
-        self.assertEqual(generate.normalize_answer_value("income effect", "What term?", support + " This is called a different income effect because costs fall."), "income effect")
+    def test_category_and_source_terms_are_not_rewritten(self):
+        """保留模型的实体和术语，不通过原文补词或语义规则改写答案。"""
+        for value, question in (("sublinearly", "How does energy scale?"),
+                                ("node-level and system-level", "Which levels?"),
+                                ("prompt prefill", "Which stage?"),
+                                ("income effect", "What term is it known by?")):
+            with self.subTest(value=value):
+                self.assertEqual(generate.normalize_answer_value(value, question), value)
 
-    def test_bad_audit_or_formula_preserves_core_answer(self):
-        """来源标记、核对结构或算式异常只停用复算，不抹掉已有答案。"""
+    def test_retired_audit_fields_are_absent_from_schema(self):
+        """精简 schema 不要求数值抽取、可执行算式或额外正确性标记。"""
+        properties = generate.AnswerDraft.model_json_schema()["properties"]
+        self.assertEqual(next(iter(properties)), "explanation")
+        for field in ("numeric_facts", "calculation", "visual_readings",
+                      "unresolved_conflict", "selection_reason"):
+            self.assertNotIn(field, properties)
         parser = PydanticOutputParser(pydantic_object=generate.AnswerDraft)
-        with self.assertLogs(generate.logger):
-            draft = parser.parse('{"answer_value": 42, "numeric_facts": [{"value": 1}]}')
+        draft = parser.parse('{"answer_value": 42, "numeric_facts": [{"value": 1}], "calculation": "v1 / 0"}')
         self.assertEqual(draft.answer_value, 42)
-        self.assertEqual(draft.numeric_facts, [])
-        fact = generate.NumericFact(value="42", unit="", conditions="reported total",
-                                    evidence_id="text", matches_question=True)
-        record = document("text").metadata
-        for expression, source in (("v1 / 0", "text"), ("v1 + v2", "text"), ("v1", "unknown")):
-            with self.subTest(expression=expression, source=source), self.assertLogs(generate.logger):
-                draft = generate.AnswerDraft(answer_value="42", calculation=expression,
-                    numeric_facts=[fact.model_copy(update={"evidence_id": source})]).model_dump()
-                self.assertEqual(generate.verify_numeric_answer(draft, [record], "")["answer_value"], "42")
 
-    def test_unresolved_visual_conflict_abstains(self):
-        """两份真实图像的条件匹配读数无法协调时，不继续输出任意一份。"""
-        readings = [generate.NumericFact(value=value, unit="seconds",
-                    conditions="target model, batch=1, stacked total",
-                    evidence_id=key, matches_question=True)
-                    for key, value in (("stages", "2.7"), ("layers", "2.0"))]
-        draft = generate.AnswerDraft(answer_value="2.7", visual_readings=readings,
-                    unresolved_conflict=True, selection_reason="The scope difference is unsupported.").model_dump()
-        evidence = [{"evidence_id": key, "image_paths": [f"{key}.png"]}
-                    for key in ("stages", "layers")]
-        result = generate.verify_visual_answer(draft, evidence)
+    def test_model_visual_abstention_is_preserved(self):
+        """图表证据冲突时，模型明确给出的拒答及其原因继续保留。"""
+        record = {**document("chart").metadata, "pages": [1], "image_paths": ["chart.png"]}
+        draft = generate.AnswerDraft(answer_value="is_blank", answer="is_blank",
+                    explanation="Matching charts conflict and the scope difference is unsupported.")
+        with patch.object(generate, "image_block", return_value={"type": "image_url"}), patch.object(generate, "get_llm") as llm:
+            llm.return_value.with_structured_output.return_value.invoke.return_value = draft
+            result = generate.generate_answer("q", "seconds", [record])
         self.assertEqual(result["answer_value"], "is_blank")
-        self.assertIn("stages: 2.7 seconds", result["explanation"])
-        self.assertIn("layers: 2.0 seconds", result["explanation"])
         self.assertIn("scope difference", result["explanation"])
 
     def test_quote_owner_corrects_citation_without_changing_answer(self):
@@ -485,14 +533,11 @@ class PipelineTests(unittest.TestCase):
             {"evidence_id": "right", "ref_id": "actual", "content": "Results: " + quote, "pages": [10], "image_paths": []},
         ]
         draft = generate.AnswerDraft(answer_value=200, ref_ids=["unrelated"],
-            supports=[generate.EvidenceSupport(evidence_id="wrong", quote=quote)],
-            numeric_facts=[generate.NumericFact(value=200, unit="g/kWh", conditions="average",
-                evidence_id="wrong", matches_question=True)]).model_dump()
+            supports=[generate.EvidenceSupport(evidence_id="wrong", quote=quote)]).model_dump()
         with self.assertLogs(generate.logger):
             result = generate.verify_supports(draft, evidence)
         self.assertEqual(result["answer_value"], 200)
         self.assertEqual(result["ref_ids"], ["actual"])
-        self.assertEqual(result["numeric_facts"][0]["evidence_id"], "right")
         self.assertIn("[right; pages=[10]]", result["supporting_materials"])
 
     def test_quote_within_one_paper_can_match_chunk_and_page(self):
@@ -530,7 +575,7 @@ class PipelineTests(unittest.TestCase):
                   "content": "The measured average is 200 grams per kWh."}
         draft = generate.AnswerDraft(answer_value=200,
                     supports=[generate.EvidenceSupport(evidence_id="E1", quote=record["content"])])
-        with patch.object(generate, "get_mimo") as mimo:
+        with patch.object(generate, "get_llm") as mimo:
             mimo.return_value.with_structured_output.return_value.invoke.return_value = draft
             result = generate.generate_answer("q", "g/kWh", [record])
         self.assertEqual(result["supports"][0]["evidence_id"], "paper:text:1")
@@ -568,40 +613,29 @@ class PipelineTests(unittest.TestCase):
             for item in evidence]).model_dump()
         self.assertEqual(generate.verify_supports(draft, evidence)["ref_ids"], ["a", "b"])
 
-    def test_calculation_sources_override_corroboration_flag(self):
-        """操作数标签经引文修正后仍保护来源，即使被误标成旁证也不删。"""
+    def test_calculation_preserves_both_required_sources(self):
+        """跨论文计算的两个主证据均保留，错误标签可按逐字引文修正。"""
         evidence = [{"evidence_id": f"{key}:text", "ref_id": key, "pages": [1],
                      "content": f"The measured energy for experiment {key} is {value} kWh.",
                      "image_paths": []} for key, value in (("a", 20), ("b", 10))]
-        # 第一项故意挂错标签，检验保护在原有归属修正之后执行。
-        draft = generate.AnswerDraft(answer_value="2", calculation="v1 / v2",
-            supports=[{"evidence_id": "wrong", "quote": evidence[0]["content"], "required": False},
-                      {"evidence_id": "b:text", "quote": evidence[1]["content"], "required": True}],
-            numeric_facts=[generate.NumericFact(value=value, unit="kWh", conditions="matching operand",
-                evidence_id=key, matches_question=True) for key, value in (("wrong", 20), ("b:text", 10))]).model_dump()
+        draft = generate.AnswerDraft(answer_value="2",
+            supports=[{"evidence_id": "wrong", "quote": evidence[0]["content"], "required": True},
+                      {"evidence_id": "b:text", "quote": evidence[1]["content"], "required": True}]).model_dump()
         with self.assertLogs(generate.logger):
             result = generate.verify_supports(draft, evidence)
-        self.assertEqual(result["numeric_facts"][0]["evidence_id"], "a:text")
         self.assertEqual(result["ref_ids"], ["a", "b"])
-        self.assertEqual(generate.verify_numeric_answer(result, evidence, "multiplier")["answer_value"], "2")
+        self.assertEqual(result["answer_value"], "2")
 
-    def test_all_corroboration_or_unknown_operand_keeps_verified_sources(self):
-        """全部标成旁证或操作数归属不明时保守回退，保留已有正确值。"""
+    def test_all_corroboration_keeps_verified_sources(self):
+        """全部标成旁证时保守保留已有核验来源，不影响核心数值。"""
         record = {"evidence_id": "a:text", "ref_id": "a", "pages": [1],
                   "content": "The measured total energy is 20 kWh.", "image_paths": []}
-        for source in (None, "unknown", "a"):
-            with self.subTest(source=source):
-                facts = [] if source is None else [generate.NumericFact(value=20, unit="kWh",
-                    conditions="matching operand", evidence_id=source, matches_question=True)]
-                draft = generate.AnswerDraft(answer_value=20, numeric_facts=facts,
-                    supports=[{"evidence_id": "a:text", "quote": record["content"], "required": False}]).model_dump()
-                if source == "a":
-                    result = generate.verify_supports(draft, [record])
-                else:
-                    with self.assertLogs(generate.logger):
-                        result = generate.verify_supports(draft, [record])
-                self.assertEqual(result["ref_ids"], ["a"])
-                self.assertEqual(result["answer_value"], 20)
+        draft = generate.AnswerDraft(answer_value=20,
+            supports=[{"evidence_id": "a:text", "quote": record["content"], "required": False}]).model_dump()
+        with self.assertLogs(generate.logger):
+            result = generate.verify_supports(draft, [record])
+        self.assertEqual(result["ref_ids"], ["a"])
+        self.assertEqual(result["answer_value"], 20)
 
     def test_missing_or_invalid_required_flag_preserves_support(self):
         """旧草稿默认保留引用，损坏布尔标记不使支持材料被跳过。"""
@@ -641,6 +675,42 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["answer_value"], 9.1)
         self.assertEqual(result["supporting_materials"], "is_blank")
 
+    def test_short_exact_quotes_keep_citations_without_value_overrides(self):
+        """短原文和表格数值照常核验，完整数字边界不允许近似匹配。"""
+        record = {"evidence_id": "cell", "ref_id": "paper", "pages": [1],
+                  "content": "GPT-3: 5.4 million liters; multiplier 125; time 25.1 days; negative -25; exponent 25e3; total 42.", "image_paths": []}
+        for quote in ("5.4 million liters", "GPT-3", "25.1", "42", "-25", "25e3"):
+            with self.subTest(quote=quote):
+                draft = generate.AnswerDraft(answer_value=42, supports=[
+                    {"evidence_id": "cell", "quote": quote}]).model_dump()
+                result = generate.verify_supports(draft, [record])
+                self.assertEqual(result["ref_ids"], ["paper"])
+                self.assertEqual(result["answer_value"], 42)
+        draft = generate.AnswerDraft(answer_value=25, supports=[
+            {"evidence_id": "cell", "quote": "25"}]).model_dump()
+        with self.assertLogs(generate.logger):
+            result = generate.verify_supports(draft, [record])
+        self.assertEqual(result["ref_ids"], [])
+        self.assertEqual(result["answer_value"], 25)
+
+    def test_pdf_line_hyphenation_keeps_genuine_quote(self):
+        """PDF 换行拆字不丢失真实引用，数字或否定改写仍不能通过。"""
+        content = "a phase-aligned\nmetrics pipeline that attributes energy to the prefill and de-\ncode stages of every request. The total is 25.1 kWh."
+        quote = "a phase-aligned metrics pipeline that attributes energy to the prefill and decode stages of every request"
+        record = {"evidence_id": "text", "ref_id": "paper", "pages": [1], "content": content, "image_paths": []}
+        draft = generate.AnswerDraft(answer_value="prefill and decode", supports=[
+            {"evidence_id": "text", "quote": quote}]).model_dump()
+        result = generate.verify_supports(draft, [record])
+        self.assertEqual(result["ref_ids"], ["paper"])
+        self.assertEqual(result["answer_value"], "prefill and decode")
+        for bad in (quote.replace("attributes", "does not attribute"), "The total is 25.2 kWh"):
+            draft = generate.AnswerDraft(answer_value=42, supports=[
+                {"evidence_id": "text", "quote": bad}]).model_dump()
+            with self.assertLogs(generate.logger):
+                result = generate.verify_supports(draft, [record])
+                self.assertEqual(result["ref_ids"], [])
+            self.assertEqual(result["answer_value"], 42)
+
     def test_long_quote_repairs_only_one_linker_using_original_text(self):
         """长引文连接词误抄可恢复原文，数字、否定、实体及多处改写仍被拒绝。"""
         content = ("Across all ten tasks, we observe a considerable variation in measured energy use, "
@@ -657,6 +727,35 @@ class PipelineTests(unittest.TestCase):
                 draft = generate.AnswerDraft(answer_value=3.2, supports=[{"evidence_id": "text", "quote": bad}]).model_dump()
                 self.assertEqual(generate.verify_supports(draft, evidence)["ref_ids"], [])
 
+    def test_table_ellipsis_retains_exact_short_numeric_fragments(self):
+        """省略号间的短数值必须保留原始顺序、千位逗号和小数边界。"""
+        content = "| Energy Consumption (MWh) | 85.7 | 232 | 24.1 | 1,287 |"
+        record = {"evidence_id": "table", "ref_id": "paper", "pages": [1], "content": content, "image_paths": []}
+        quote = "Energy Consumption (MWh) ... 232 ... 1,287"
+        draft = generate.AnswerDraft(answer_value=42, supports=[{"evidence_id": "table", "quote": quote}]).model_dump()
+        result = generate.verify_supports(draft, [record])
+        self.assertEqual(result["ref_ids"], ["paper"])
+        for bad in (quote.replace("232", "23"), quote.replace("232", "232.0"),
+                    quote.replace("1,287", "1287"), "Energy Consumption (MWh) ... 1,287 ... 232"):
+            with self.subTest(quote=bad), self.assertLogs(generate.logger):
+                draft = generate.AnswerDraft(answer_value=42, supports=[{"evidence_id": "table", "quote": bad}]).model_dump()
+                result = generate.verify_supports(draft, [record])
+            self.assertEqual(result["ref_ids"], [])
+            self.assertEqual(result["answer_value"], 42)
+
+    def test_hyphenated_compound_requires_actual_pdf_linebreak(self):
+        """只对原文确有换行的复合词整理拼写，同行连字符及否定仍严格匹配。"""
+        quote = "Energy attribution requires assumptions, making the result deployment-dependent in this context."
+        record = {"evidence_id": "page", "ref_id": "paper", "pages": [1],
+                  "content": quote.replace("deployment-dependent", "deployment-\ndependent"), "image_paths": []}
+        draft = generate.AnswerDraft(answer_value=1, supports=[{"evidence_id": "page", "quote": quote}]).model_dump()
+        self.assertEqual(generate.verify_supports(draft, [record])["ref_ids"], ["paper"])
+        for content in (quote.replace("deployment-dependent", "deploymentdependent"),
+                        record["content"].replace("requires", "does not require")):
+            with self.subTest(content=content), self.assertLogs(generate.logger):
+                draft = generate.AnswerDraft(answer_value=1, supports=[{"evidence_id": "page", "quote": quote}]).model_dump()
+                self.assertEqual(generate.verify_supports(draft, [{**record, "content": content}])["ref_ids"], [])
+
     def test_table_quote_recovers_exact_rows_without_invented_header(self):
         """重排过表头的引用仍可用逐字原始行核验，输出省略标记而非伪引文。"""
         caption = "Table 2: Throughput for the different training stages."
@@ -670,25 +769,14 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("101 4 4 12 192 2160 165 52.88%", result["supporting_materials"])
         self.assertIn(" … ", result["supporting_materials"])
 
-    def test_resolved_or_invalid_visual_check_preserves_core(self):
-        """已解决差异、损坏记录、单一来源或不存在的图片来源均保留核心值。"""
-        fact = generate.NumericFact(value="2", unit="seconds", conditions="target total",
-                                   evidence_id="first", matches_question=True)
-        record = {"evidence_id": "first", "image_paths": ["first.png"]}
-        draft = generate.AnswerDraft(answer_value="2", visual_readings=[fact]).model_dump()
-        self.assertEqual(generate.verify_visual_answer(draft, [record])["answer_value"], "2")
-        for other in (fact, fact.model_copy(update={"evidence_id": "missing"}),
-                      fact.model_copy(update={"evidence_id": "second", "matches_question": False})):
-            with self.subTest(other=other), self.assertLogs(generate.logger):
-                draft = generate.AnswerDraft(answer_value="2", visual_readings=[fact, other],
-                                             unresolved_conflict=True).model_dump()
-                self.assertEqual(generate.verify_visual_answer(draft, [record])["answer_value"], "2")
+    def test_visual_condition_flags_do_not_override_final_answer(self):
+        """旧的图表条件和冲突标记不触发程序拒答，也不进入新 schema。"""
         parser = PydanticOutputParser(pydantic_object=generate.AnswerDraft)
-        with self.assertLogs(generate.logger):
-            draft = parser.parse('{"answer_value": 2, "visual_readings": [{"value": 3}], "unresolved_conflict": "false"}')
-        self.assertEqual(draft.answer_value, 2)
-        self.assertEqual(draft.visual_readings, [])
-        self.assertFalse(draft.unresolved_conflict)
+        for flag in (True, False, "false", None):
+            draft = parser.parse(json.dumps({"answer_value": 2, "visual_readings": [{"value": 3}],
+                                             "unresolved_conflict": flag}))
+            self.assertEqual(draft.answer_value, 2)
+            self.assertNotIn("unresolved_conflict", draft.model_dump())
 
     def test_independent_chart_reading_binds_actual_source(self):
         """单图阅读只附当前图片，模型抄错来源时由程序覆盖。"""
@@ -697,7 +785,7 @@ class PipelineTests(unittest.TestCase):
                    for key in ("first", "second")]
         reading = generate.NumericFact(value=2, unit="seconds", conditions="stacked total",
                                         evidence_id="wrong", matches_question=True)
-        with patch.object(generate, "image_block", return_value={"type": "image_url"}) as image, patch.object(generate, "get_mimo") as mimo:
+        with patch.object(generate, "image_block", return_value={"type": "image_url"}) as image, patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.return_value = generate.ChartReadings(readings=[reading])
             result = generate.read_chart("q", "seconds", records[0], records)
@@ -712,22 +800,21 @@ class PipelineTests(unittest.TestCase):
         readings = [generate.NumericFact(value=value, unit="seconds", conditions="target stacked total",
                     evidence_id=key, matches_question=True).model_dump()
                     for key, value in (("stages", 2.7), ("layers", 2))]
-        final = generate.AnswerDraft(answer_value=2.7, unresolved_conflict=True, visual_readings=readings,
-                    selection_reason="No source passage resolves the conflicting totals.")
+        final = generate.AnswerDraft(answer_value="is_blank", explanation="No source passage resolves the conflicting totals: stages 2.7 seconds; layers 2 seconds.")
         def isolated_read(question, unit, record, evidence):
             """按真实来源返回独立读数，结果不受并发完成顺序影响。"""
             return [reading for reading in readings if reading["evidence_id"] == record["evidence_id"]]
-        with patch.object(generate, "image_block", return_value={"type": "image_url"}), patch.object(generate, "read_chart", side_effect=isolated_read) as read, patch.object(generate, "get_mimo") as mimo:
+        with patch.object(generate, "image_block", return_value={"type": "image_url"}), patch.object(generate, "read_chart", side_effect=isolated_read) as read, patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.bind.return_value = model
             model.invoke.return_value = final
             result = generate.generate_answer("q", "seconds", evidence)
         self.assertEqual(read.call_count, 2)
         self.assertEqual(model.invoke.call_count, 1)
-        model.bind.assert_called_once_with(extra_body={"thinking": {"type": "disabled"}})
+        model.bind.assert_not_called()
         self.assertTrue(all(block["type"] == "text" for block in model.invoke.call_args.args[0][1].content))
         self.assertEqual(result["answer_value"], "is_blank")
-        self.assertIn("layers: 2 seconds", result["explanation"])
+        self.assertIn("layers 2 seconds", result["explanation"])
 
     def test_chart_coordinator_decision_is_not_overwritten(self):
         """独立 reader 的局部读数经协调排除后，不重新变为匹配的总计。"""
@@ -738,18 +825,18 @@ class PipelineTests(unittest.TestCase):
                for key, value in (("whole", 2), ("kernel", .002))]
         final = generate.AnswerDraft(answer_value=2, unresolved_conflict=True,
             visual_readings=[{**raw[0]}, {**raw[1], "matches_question": False, "conditions": "individual kernel"}])
-        with patch.object(generate, "get_mimo") as mimo, self.assertLogs(generate.logger):
+        with patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.bind.return_value = model
             model.invoke.return_value = final
             result = generate.generate_answer("whole-model time?", "seconds", evidence, visual_readings=raw)
         self.assertEqual(result["answer_value"], 2)
-        self.assertFalse(result["visual_readings"][1]["matches_question"])
+        self.assertNotIn("visual_readings", result)
 
     def test_chart_parser_failure_is_local_but_api_failure_raises(self):
         """单图读数解析失败允许回退，连接错误继续作为系统故障抛出。"""
         record = {**document("image").metadata, "pages": [1], "image_paths": ["image.png"]}
-        with patch.object(generate, "image_block", return_value={"type": "image_url"}), patch.object(generate, "get_mimo") as mimo:
+        with patch.object(generate, "image_block", return_value={"type": "image_url"}), patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.side_effect = OutputParserException("bad chart reading")
             with self.assertLogs(generate.logger):
@@ -762,7 +849,7 @@ class PipelineTests(unittest.TestCase):
         """单图判断没有相关数值时，不重复识别无关图；正文答案照常保留。"""
         evidence = [{**document(key).metadata, "modality": "image", "pages": [1],
                      "image_paths": [f"{key}.png"]} for key in ("first", "second")]
-        with patch.object(generate, "read_chart", return_value=[]), patch.object(generate, "image_block") as image, patch.object(generate, "get_mimo") as mimo:
+        with patch.object(generate, "read_chart", return_value=[]), patch.object(generate, "image_block") as image, patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.bind.return_value = model
             model.invoke.return_value = generate.AnswerDraft(answer_value=42)
@@ -771,16 +858,16 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["answer_value"], 42)
 
     def test_visual_check_uses_only_attached_images(self):
-        """生成后检查只接受已附图的来源；缺图不会误触发程序拒答。"""
+        """图像标签绑定实际附件，程序不根据图表标记改写核心答案。"""
         evidence = [{**document(key).metadata, "pages": [1], "image_paths": [f"{key}.png"]}
                     for key in ("first", "second")]
         readings = [generate.NumericFact(value=value, unit="seconds", conditions="target total",
                                         evidence_id=key, matches_question=True)
                     for key, value in (("first", "2.7"), ("second", "2"))]
         draft = generate.AnswerDraft(answer_value="2.7", visual_readings=readings, unresolved_conflict=True)
-        for blocks, expected in (([{"type": "image_url"}] * 2, "is_blank"),
+        for blocks, expected in (([{"type": "image_url"}] * 2, "2.7"),
                                   ([{"type": "image_url"}, None], "2.7")):
-            with self.subTest(expected=expected), patch.object(generate, "image_block", side_effect=blocks), patch.object(generate, "get_mimo") as mimo:
+            with self.subTest(expected=expected), patch.object(generate, "image_block", side_effect=blocks), patch.object(generate, "get_llm") as mimo:
                 mimo.return_value.with_structured_output.return_value.invoke.return_value = draft
                 result = generate.generate_answer("q", "seconds", evidence)
                 self.assertEqual(result["answer_value"], expected)
@@ -788,19 +875,48 @@ class PipelineTests(unittest.TestCase):
                 labels = [block["text"] for block in content if block["type"] == "text"
                           and block["text"].startswith("Attached image")]
                 self.assertIn("Attached image 1: evidence_id=first", labels[0])
-                if expected == "is_blank":
+                if len(labels) > 1:
                     self.assertIn("Attached image 2: evidence_id=second", labels[1])
 
     def test_visual_audit_fields_are_not_exported(self):
-        """读图检查字段留在内部，不改变比赛 CSV 列。"""
+        """单图读数仅作为模型上下文，不改变比赛 CSV 列。"""
         record = {**document("image").metadata, "pages": [1], "image_paths": ["image.png"]}
         draft = generate.AnswerDraft(answer_value="2", answer="2 seconds", ref_ids=["paper"],
-                    supporting_materials="bar total", explanation="matching scope",
-                    selection_reason="Only one chart matches.").model_dump()
+                    supporting_materials="bar total", explanation="matching scope").model_dump()
         with patch.object(generate, "plan_queries", return_value=["q"]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "generate_answer", return_value=draft):
             row = generate.answer_one({"id": "q", "question": "q"}, {"paper": {"url": "https://example.com"}})
         for field in ("visual_readings", "unresolved_conflict", "selection_reason"):
             self.assertNotIn(field, row)
+
+    def test_json_length_retry_is_bounded_and_keeps_original_input(self):
+        """输出截断只扩大预算重试一次，不向模型提供截断结果或标准答案。"""
+        messages = [generate.SystemMessage(content="Output JSON."), generate.HumanMessage(content="Original evidence.")]
+        error = generate.LengthFinishReasonError(completion=SimpleNamespace(usage=None))
+        expected = generate.AnswerDraft(answer_value="42")
+        with patch.object(generate, "get_llm") as llm, self.assertLogs(generate.logger):
+            model = llm.return_value.with_structured_output.return_value
+            model.invoke.side_effect = [error, expected]
+            self.assertEqual(generate.invoke_json(generate.AnswerDraft, messages), expected)
+            calls = model.invoke.call_args_list
+            self.assertEqual([call.kwargs["max_tokens"] for call in calls], [8192, 16384])
+            self.assertEqual(calls[1].args[0][:2], messages)
+            self.assertEqual(len(messages), 2)
+            model.invoke.side_effect = error
+            with self.assertRaises(generate.LengthFinishReasonError):
+                generate.invoke_json(generate.AnswerDraft, messages)
+            self.assertEqual(model.invoke.call_count, 4)
+
+    def test_generation_submission_unit_is_last_and_in_schema(self):
+        """提交单位在末尾和字段说明中明确，证据仍以完整原文传给模型。"""
+        record = {**document("text").metadata, "pages": [1], "image_paths": []}
+        with patch.object(generate, "get_llm") as llm:
+            model = llm.return_value.with_structured_output.return_value
+            model.invoke.return_value = generate.AnswerDraft(answer_value=5400000)
+            generate.generate_answer("How many million liters?", "liters", [record])
+        messages = model.invoke.call_args.args[0]
+        self.assertIn("Submission unit: liters", messages[0].content)
+        self.assertIn("answer_value must be expressed in liters", messages[1].content[-1]["text"])
+        self.assertTrue(any(record["content"] in block.get("text", "") for block in messages[1].content))
 
     def test_chunking_failure_uses_extracted_text(self):
         """结构化分块损坏后保留已解析的正文。"""
@@ -811,7 +927,7 @@ class PipelineTests(unittest.TestCase):
         splitter = Mock()
         splitter.split_text.side_effect = lambda text: [text]
         with self.assertLogs(ingest.logger):
-            self.assertEqual(list(ingest.get_text_chunks(doc, chunker, splitter, {})), [("original text", [item])])
+            self.assertEqual(list(ingest.get_text_chunks(doc, chunker, splitter)), [("original text", [item])])
 
     def test_partial_pdf_and_missing_picture_continue(self):
         """部分解析成功、无截图且无图题时，仍保留正文。"""
@@ -841,7 +957,7 @@ class PipelineTests(unittest.TestCase):
         doc = SimpleNamespace(tables=[], pictures=pictures)
         result = SimpleNamespace(status=ingest.ConversionStatus.SUCCESS, document=doc)
         text_item = SimpleNamespace(prov=[SimpleNamespace(page_no=1)])
-        with tempfile.TemporaryDirectory() as directory, patch.object(ingest, "ARTIFACTS_DIR", Path(directory)), patch.object(ingest, "get_converter") as converter, patch.object(ingest, "get_chunker"), patch.object(ingest.RecursiveCharacterTextSplitter, "from_huggingface_tokenizer") as splitter_factory, patch.object(ingest, "get_text_chunks", return_value=[("text", [text_item])]), patch.object(ingest, "save_item_images", return_value=["body.png"]) as export, patch.object(ingest, "describe_pictures", return_value=["first", "second"]) as describe:
+        with tempfile.TemporaryDirectory() as directory, patch.object(ingest, "ARTIFACTS_DIR", Path(directory)), patch.object(ingest, "get_converter") as converter, patch.object(ingest, "get_chunker"), patch.object(ingest.RecursiveCharacterTextSplitter, "from_huggingface_tokenizer") as splitter_factory, patch.object(ingest, "split_search_text", side_effect=lambda text, prefix, tokenizer: [text]), patch.object(ingest, "get_text_chunks", return_value=[("text", [text_item])]), patch.object(ingest, "save_item_images", return_value=["body.png"]) as export, patch.object(ingest, "describe_pictures", return_value=["first", "second"]) as describe:
             converter.return_value.convert.return_value = result
             splitter_factory.return_value.split_text.side_effect = lambda text: [text]
             records = ingest.ingest_pdf("paper.pdf")
@@ -857,25 +973,27 @@ class PipelineTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 ingest.ingest_pdf("paper.pdf")
 
-    def test_table_export_failure_keeps_chunk_and_image(self):
-        """单张表格导出失败时保留表格块和可用截图。"""
+    def test_table_export_failure_keeps_original_image(self):
+        """表格导出失败时保留原图，检索转写不进入原始证据字段。"""
         table = Mock(spec=ingest.TableItem)
         table.self_ref = "#/tables/0"
         table.prov = [SimpleNamespace(page_no=1)]
         table.export_to_markdown.side_effect = ValueError("bad cells")
         result = SimpleNamespace(status=ingest.ConversionStatus.SUCCESS,
                                  document=SimpleNamespace(tables=[table], pictures=[]))
-        with tempfile.TemporaryDirectory() as directory, patch.object(ingest, "ARTIFACTS_DIR", Path(directory)), patch.object(ingest, "get_converter") as converter, patch.object(ingest, "get_chunker"), patch.object(ingest.RecursiveCharacterTextSplitter, "from_huggingface_tokenizer"), patch.object(ingest, "get_text_chunks", return_value=[("table chunk", [table])]), patch.object(ingest, "save_item_images", return_value=["table.png"]), self.assertLogs(ingest.logger):
+        with tempfile.TemporaryDirectory() as directory, patch.object(ingest, "ARTIFACTS_DIR", Path(directory)), patch.object(ingest, "get_converter") as converter, patch.object(ingest, "get_chunker"), patch.object(ingest.RecursiveCharacterTextSplitter, "from_huggingface_tokenizer"), patch.object(ingest, "split_search_text", side_effect=lambda text, prefix, tokenizer: [text]), patch.object(ingest, "get_text_chunks", return_value=[]), patch.object(ingest, "describe_picture", return_value="retrieval transcription"), patch.object(ingest, "save_item_images", return_value=["table.png"]), self.assertLogs(ingest.logger):
             converter.return_value.convert.return_value = result
             records = ingest.ingest_pdf("paper.pdf")
-        self.assertEqual(records[0].metadata["content"], "table chunk")
+        self.assertIn("unreliable", records[0].metadata["content"])
+        self.assertNotIn("retrieval transcription", records[0].metadata["content"])
+        self.assertEqual(records[0].page_content, "retrieval transcription")
         self.assertEqual(json.loads(records[0].metadata["image_paths"]), ["table.png"])
 
     def test_generation_omits_missing_image(self):
         """缺图后仍发送文字，并明确提醒模型不能推测图中数值。"""
         record = {**document("table").metadata, "pages": [1],
                   "image_paths": ["missing.png"], "search_facts": [2]}
-        with patch.object(generate, "image_block", return_value=None), patch.object(generate, "get_mimo") as mimo:
+        with patch.object(generate, "image_block", return_value=None), patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.return_value = generate.AnswerDraft(**generate.blank_answer("Insufficient evidence."))
             generate.generate_answer("q", "", [record], ["first fact", "second fact"])
@@ -887,12 +1005,25 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(record["search_facts"], [2])
             self.assertIn("alternative phrasings of the same fact", content[0]["text"])
 
+    def test_table_image_can_supply_visual_support(self):
+        """表格原截图可提供单元格引用，不需要把检索转写当成原文。"""
+        record = {**document("table").metadata, "pages": [1], "image_paths": ["table.png"],
+                  "content": "Table text extraction is unreliable; read the attached original table images."}
+        visual = "Model-A row, Energy (Wh) column: 2.50 Wh."
+        with patch.object(generate, "image_block", return_value={"type": "image_url"}), patch.object(generate, "get_llm") as llm:
+            llm.return_value.with_structured_output.return_value.invoke.return_value = generate.AnswerDraft(
+                answer_value="2.50", supports=[{"evidence_id": "E1", "quote": "", "visual_detail": visual}])
+            draft = generate.generate_answer("Energy of Model-A?", "Wh", [record])
+        self.assertEqual(draft["ref_ids"], ["paper"])
+        self.assertIn(visual, draft["supporting_materials"])
+        self.assertIn("figure OR table images", generate.SYSTEM_PROMPT)
+
     def test_picture_description_reuses_exact_duplicates(self):
         """精确重复图片只生成一次描述，但返回每个图片元素的结果。"""
         jobs = [
-            (SimpleNamespace(), ["first.png"], "same caption"),
-            (SimpleNamespace(), ["second.png"], "same caption"),
-            (SimpleNamespace(), ["third.png"], "other caption"),
+            (SimpleNamespace(), ["first.png"], "same caption", "same context"),
+            (SimpleNamespace(), ["second.png"], "same caption", "same context"),
+            (SimpleNamespace(), ["third.png"], "other caption", "other context"),
         ]
         with patch.object(ingest, "inspect_picture", side_effect=[((1, "same"), False), ((1, "same"), False), ((2, "other"), False)]), patch.object(ingest, "read_description_cache", return_value=None), patch.object(ingest, "describe_picture", side_effect=["same description", "other description"]):
             descriptions = ingest.describe_pictures(jobs, "paper")
@@ -900,7 +1031,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_blank_picture_skips_remote_description(self):
         """完全空白图片只保留图题，不调用远程描述。"""
-        jobs = [(SimpleNamespace(), ["blank.png"], "blank caption")]
+        jobs = [(SimpleNamespace(), ["blank.png"], "blank caption", "")]
         with patch.object(ingest, "inspect_picture", return_value=((1, "blank"), True)), patch.object(ingest, "describe_picture") as describe:
             self.assertEqual(ingest.describe_pictures(jobs, "paper"), ["blank caption"])
             describe.assert_not_called()
@@ -920,7 +1051,7 @@ class PipelineTests(unittest.TestCase):
                 return (generate.blank_answer("Generation fallback: bad JSON")
                         if question == "first" else valid.model_dump())
 
-            with patch.object(generate, "ROOT", root), patch.object(generate, "plan_queries", side_effect=lambda question: [question]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "get_mimo"), patch.object(generate, "get_vector_store"), patch.object(generate, "get_reranker"), patch.object(generate, "generate_answer", side_effect=draft_for):
+            with patch.object(generate, "ROOT", root), patch.object(generate, "plan_queries", side_effect=lambda question: [question]), patch.object(generate, "retrieve_facts", return_value=[record]), patch.object(generate, "get_llm"), patch.object(generate, "get_vector_store"), patch.object(generate, "get_reranker"), patch.object(generate, "generate_answer", side_effect=draft_for):
                 output = generate.predict_all()
             with output.open(encoding="utf-8", newline="") as file:
                 rows = list(csv.DictReader(file))
@@ -943,7 +1074,7 @@ class PipelineTests(unittest.TestCase):
             (root / "input/test_Q.csv").write_text(
                 "id,question\nq1,first\nq2,second\nq3,third\n", encoding="utf-8"
             )
-            with patch.object(generate, "ROOT", root), patch.object(generate, "get_mimo"), patch.object(generate, "get_vector_store"), patch.object(generate, "get_reranker"), patch.object(generate, "answer_one", side_effect=fake_answer):
+            with patch.object(generate, "ROOT", root), patch.object(generate, "get_llm"), patch.object(generate, "get_vector_store"), patch.object(generate, "get_reranker"), patch.object(generate, "answer_one", side_effect=fake_answer):
                 output = generate.predict_all()
             with output.open(encoding="utf-8", newline="") as file:
                 rows = list(csv.DictReader(file))
@@ -969,7 +1100,7 @@ class PredictionResumeTests(unittest.TestCase):
         self.progress = self.output.with_suffix(".progress.jsonl")
         self.failed = self.output.with_suffix(".failed.csv")
         self.enterContext(patch.object(generate, "ROOT", self.root))
-        self.mimo = self.enterContext(patch.object(generate, "get_mimo"))
+        self.mimo = self.enterContext(patch.object(generate, "get_llm"))
         self.store = self.enterContext(patch.object(generate, "get_vector_store"))
         self.reranker = self.enterContext(patch.object(generate, "get_reranker"))
 
@@ -1033,6 +1164,26 @@ class PredictionResumeTests(unittest.TestCase):
         self.assertEqual([row["answer_value"] for row in results], ["43", "42", "42"])
         with self.failed.open(encoding="utf-8", newline="") as file:
             self.assertEqual(list(csv.DictReader(file)), [])
+
+    def test_persistent_length_failure_skips_question_without_fake_blank(self):
+        """持续截断记录失败并继续其他题，后续仅补做缺题，不伪造完整提交。"""
+        error = generate.LengthFinishReasonError(completion=SimpleNamespace(usage=None))
+        self.output.write_text("previous complete submission", encoding="utf-8")
+
+        def fake_answer(row, _metadata):
+            """只模拟一个局部截断失败，其他题保持正常。"""
+            if row["id"] == "q1":
+                raise error
+            return {**row, "answer_value": "42"}
+
+        with patch.object(generate, "answer_one", side_effect=fake_answer), self.assertLogs(generate.logger):
+            self.assertIsNone(generate.predict_all())
+        self.assertEqual(self.output.read_text(encoding="utf-8"), "previous complete submission")
+        self.assertEqual(set(generate.read_progress(self.progress, self.questions())), {"q2", "q3"})
+        with self.failed.open(encoding="utf-8", newline="") as file:
+            failures = list(csv.DictReader(file))
+        self.assertEqual([row["id"] for row in failures], ["q1"])
+        self.assertIn("length limit", failures[0]["error"])
 
     def test_all_saved_results_export_without_api_and_preserve_current_input(self):
         """完整进度可直接导出；数值零、拒答和本轮 Cohort 都保持正确。"""

@@ -10,6 +10,7 @@ requires-python = ">=3.14"
 dependencies = [
     "docling>=2.130.0",
     "docling-core[chunking]",
+    "fonttools>=4.66.1",
     "langchain-chroma>=1.1.0",
     "langchain-classic>=1.0.8",
     "langchain-community>=0.4.2",
