@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
@@ -421,10 +422,8 @@ def generate_answer(question: str, answer_unit: str, evidence, *, visual_reading
     read_sources = {reading["evidence_id"] for reading in visual_readings or []}
     # 有单位且同论文命中多张图时直接隔离读取，省去一轮混合多图的初始答案。
     if visual_readings is None and answer_unit.strip().lower() not in ("", "is_blank"):
-        counts = {}
-        for record in evidence:
-            if record["modality"] == "image" and record["image_paths"]:
-                counts[record["ref_id"]] = counts.get(record["ref_id"], 0) + 1
+        counts = Counter(record["ref_id"] for record in evidence
+                         if record["modality"] == "image" and record["image_paths"])
         charts = [record for record in evidence if record["modality"] == "image"
                   and record["image_paths"] and counts.get(record["ref_id"], 0) > 1]
         if charts:
@@ -434,11 +433,7 @@ def generate_answer(question: str, answer_unit: str, evidence, *, visual_reading
             if all(group is not None for group in groups):
                 visual_readings = [reading for group in groups for reading in group]
                 read_sources.update(record["evidence_id"] for record in charts)
-    unit_hint = (
-        "not specified"
-        if not answer_unit.strip() or answer_unit.strip().lower() == "is_blank"
-        else answer_unit
-    )
+    unit_hint = "not specified" if answer_unit.strip().lower() in ("", "is_blank") else answer_unit
     # 查询规划只服务检索；最终模型直接阅读原题、单位和原始证据，避免改写锚定。
     content = [{"type": "text", "text": f"Question: {question}\nExpected unit: {unit_hint}"}]
     if visual_readings is not None:
@@ -570,34 +565,28 @@ def answer_one(row, metadata_by_id):
     else:
         if not ref_ids:
             logger.warning("%s 无有效引用，仅清空引用字段，保留 answer_value", row["id"])
-        if not draft["answer"].strip() or draft["answer"].strip().lower() == "is_blank":
+        if draft["answer"].strip().lower() in ("", "is_blank"):
             logger.warning("%s 缺少可读答案，使用 answer_value 作为 answer", row["id"])
             draft["answer"] = answer_value
-        if not draft["supporting_materials"].strip() or draft["supporting_materials"].strip().lower() == "is_blank":
+        if draft["supporting_materials"].strip().lower() in ("", "is_blank"):
             logger.warning("%s 缺少 supporting_materials，仅将该字段置为 is_blank", row["id"])
             draft["supporting_materials"] = "is_blank"
 
     # 说明缺失时明确标记缺失，不把占位说明包装成有效推理或正确性证明。
-    if not draft["explanation"].strip() or draft["explanation"].strip().lower() == "is_blank":
+    if draft["explanation"].strip().lower() in ("", "is_blank"):
         logger.warning("%s 缺少 explanation，填入缺失说明，不改写 answer_value", row["id"])
         draft["explanation"] = "The model did not provide an explanation; no reasoning has been reconstructed."
 
     # 保留输入里的 id、question、answer_unit 和 Cohort 等字段，只覆盖答案列。
-    submission_row = dict(row)
-    submission_row.update({
+    return {
+        **row,
         "answer": "is_blank" if is_blank else draft["answer"],
         "answer_value": answer_value,
         "ref_id": json.dumps(ref_ids) if ref_ids else "is_blank",
-        "ref_url": (
-            json.dumps([metadata_by_id[ref_id]["url"] for ref_id in ref_ids])
-            if ref_ids else "is_blank"
-        ),
-        "supporting_materials": (
-            "is_blank" if is_blank else draft["supporting_materials"]
-        ),
+        "ref_url": json.dumps([metadata_by_id[ref_id]["url"] for ref_id in ref_ids]) if ref_ids else "is_blank",
+        "supporting_materials": "is_blank" if is_blank else draft["supporting_materials"],
         "explanation": draft["explanation"],
-    })
-    return submission_row
+    }
 
 
 def answer_with_retry(row, metadata_by_id):

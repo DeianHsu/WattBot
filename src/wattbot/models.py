@@ -25,49 +25,41 @@ RETRIEVAL_K = 60
 KEYWORD_K = 60
 FINAL_TOP_K = 10
 RERANK_K = RETRIEVAL_K + KEYWORD_K
-# 两家客户端共用连接参数；密钥、地址与客户端缓存仍各自独立。
-CHAT_OPTIONS = {"temperature": 0, "timeout": 120, "max_retries": 2}
 logger = logging.getLogger(__name__)
 # PDFium 不支持多线程同时调用；只串行本地渲染，不阻塞远程模型请求。
 PAGE_RENDER_LOCK = Lock()
 
 
+def _chat_client(model, key_name, base_url):
+    """共用客户端构造，只读取当前供应商的密钥。"""
+    # 延迟读取配置，不在导入模块时要求密钥或创建客户端。
+    load_dotenv(ROOT / ".env")
+    api_key = os.getenv(key_name)
+    if not api_key:
+        raise RuntimeError(f"请在项目 .env 中设置 {key_name}")
+
+    # 保持关闭思考、网络超时和重试设置；调用方分别缓存客户端。
+    return ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0,
+        extra_body={"thinking": {"type": "disabled"}},
+        timeout=120,
+        max_retries=2,
+    )
+
+
 @lru_cache(maxsize=1)
 def get_mimo():
     """获取 MiMo 客户端；缓存客户端对象，不缓存问题或答案。"""
-    # 在真正需要调用生成模型时读取密钥，避免导入文件就要求配置密钥。
-    load_dotenv(ROOT / ".env")
-    api_key = os.getenv("MIMO_API_KEY")
-    if not api_key:
-        raise RuntimeError("请在项目 .env 中设置 MIMO_API_KEY")
-
-    # 图片描述和最终答案共用一个模型；小样对照无答案回退，默认关闭深度思考。
-    return ChatOpenAI(
-        model="mimo-v2.6-flash",
-        api_key=api_key,
-        base_url="https://api.xiaomimimo.com/v1",
-        extra_body={"thinking": {"type": "disabled"}},
-        **CHAT_OPTIONS,
-    )
+    return _chat_client("mimo-v2.6-flash", "MIMO_API_KEY", "https://api.xiaomimimo.com/v1")
 
 
 @lru_cache(maxsize=1)
 def get_deepseek():
     """获取 DeepSeek 多模态客户端；缓存客户端对象，不缓存问题或答案。"""
-    # 仅在选择 DeepSeek 时读取密钥，不要求同时配置两个供应商。
-    load_dotenv(ROOT / ".env")
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("请在项目 .env 中设置 DEEPSEEK_API_KEY")
-
-    # 图片描述和问答共用原生多模态模型；沿用关闭思考和网络超时设置。
-    return ChatOpenAI(
-        model="deepseek-flash",
-        api_key=api_key,
-        base_url="https://api.deepseek.com",
-        extra_body={"thinking": {"type": "disabled"}},
-        **CHAT_OPTIONS,
-    )
+    return _chat_client("deepseek-flash", "DEEPSEEK_API_KEY", "https://api.deepseek.com")
 
 
 def get_llm():

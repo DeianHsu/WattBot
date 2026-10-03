@@ -40,7 +40,6 @@ def keyword_search(question, store, entities=()):
              if len(word) >= 3 and word not in stopwords]
     if not words:
         return []
-    expression = " OR ".join(f'"{word}"' for word in words)
     # 短语召回占一半名额，防止精确术语被大量只匹配通用单词的块挤走。
     phrases = list(dict.fromkeys(f"{a} {b}" for a, b in zip(tokens, tokens[1:])
                    if a in words and b in words))
@@ -54,20 +53,22 @@ def keyword_search(question, store, entities=()):
                          "JOIN embeddings AS e ON e.id = f.rowid "
                          "WHERE embedding_fulltext_search MATCH ? "
                          "ORDER BY bm25(embedding_fulltext_search) LIMIT ?")
+
+            def search_ids(terms, limit):
+                """名称、短语和宽泛词共用全文查询及引号转义。"""
+                if not terms:
+                    return []
+                expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
+                return [row[0] for row in conn.execute(statement, (expression, limit))]
+
             # trigram 会命中型号前缀；只给边界完整的实体预留少量关键词名额。
-            names = [row[0] for row in conn.execute(statement, (
-                " OR ".join('"' + name.replace('"', '""') + '"' for name in entities),
-                KEYWORD_K * 4,
-            ))] if entities else []
+            names = search_ids(entities, KEYWORD_K * 4)
             patterns = [entity_pattern(name) for name in entities]
-            exact_names = [doc.id for doc in store.get_by_ids(names)
-                           if any(pattern.search(doc.page_content) for pattern in patterns)] if names else []
-            name_ids = set(exact_names)
-            names = [key for key in names if key in name_ids][:KEYWORD_K // 3]
-            exact = [row[0] for row in conn.execute(statement, (
-                " OR ".join(f'"{phrase}"' for phrase in phrases), KEYWORD_K // 2,
-            ))] if phrases else []
-            broad = [row[0] for row in conn.execute(statement, (expression, KEYWORD_K))]
+            exact_names = {doc.id for doc in store.get_by_ids(names)
+                           if any(pattern.search(doc.page_content) for pattern in patterns)} if names else set()
+            names = [key for key in names if key in exact_names][:KEYWORD_K // 3]
+            exact = search_ids(phrases, KEYWORD_K // 2)
+            broad = search_ids(words, KEYWORD_K)
             ids = list(dict.fromkeys([*names, *exact, *broad]))[:KEYWORD_K]
     except sqlite3.Error as exc:
         logger.warning("关键词检索不可用，继续使用向量召回：%s", exc)
@@ -112,14 +113,13 @@ def retrieve(question: str, ref_ids=None, *, entities=()):
             logger.warning("限定论文内没有候选，继续使用原有证据")
             return []
         raise RuntimeError("多模态索引为空，请先运行 build-index")
-    candidates, seen = [], set()
+    # 字典保留首次命中的原始块和召回顺序，同时完成去重。
+    candidates = {}
     lexical = [] if ref_ids else keyword_search(question, store, entities=entities)
     for doc in [*dense, *lexical]:
         key = doc.id or (doc.metadata.get("evidence_id"), doc.page_content)
-        if key not in seen:
-            seen.add(key)
-            candidates.append(doc)
-    ranked = list(get_reranker().compress_documents(documents=candidates, query=question))
+        candidates.setdefault(key, doc)
+    ranked = get_reranker().compress_documents(documents=list(candidates.values()), query=question)
     # 按重排顺序保留每份证据的最高排名块，去重后才计算最终 Top-K 名额。
     evidence = {}
     for doc in ranked:

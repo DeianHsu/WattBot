@@ -56,44 +56,32 @@ class PipelineTests(unittest.TestCase):
         self.enterContext(patch.object(ingest, "get_llm", side_effect=AssertionError("离线测试禁止调用真实 API")))
         self.enterContext(patch.object(generate, "get_llm", side_effect=AssertionError("离线测试禁止调用真实 API")))
 
-    def test_mimo_defaults_to_non_thinking_without_changing_model_or_timeouts(self):
-        """默认关闭思考，模型、密钥读取和网络设置保持不变；不调用 API。"""
-        # 清除客户端缓存，使用模拟配置验证实际构造参数，不读取真实密钥。
-        models.get_mimo.cache_clear()
-        self.addCleanup(models.get_mimo.cache_clear)
-        with patch.object(models, "load_dotenv"), patch.object(models.os, "getenv", return_value="test-key"), \
-             patch.object(models, "ChatOpenAI") as client:
-            self.assertIs(models.get_mimo(), client.return_value)
-            self.assertIs(models.get_mimo(), client.return_value)
-        client.assert_called_once_with(
-            model="mimo-v2.6-flash", api_key="test-key", base_url="https://api.xiaomimimo.com/v1",
-            temperature=0, extra_body={"thinking": {"type": "disabled"}}, timeout=120, max_retries=2,
-        )
-
-    def test_deepseek_client_uses_vision_model_and_is_cached(self):
-        """DeepSeek 使用原生多模态模型并复用客户端，不调用 API。"""
-        # 清除缓存，使用模拟密钥检查参数，避免读取真实配置。
-        models.get_deepseek.cache_clear()
-        self.addCleanup(models.get_deepseek.cache_clear)
-        with patch.object(models, "load_dotenv"), patch.object(models.os, "getenv", return_value="test-key"), \
-             patch.object(models, "ChatOpenAI") as client:
-            self.assertIs(models.get_deepseek(), client.return_value)
-            self.assertIs(models.get_deepseek(), client.return_value)
-        client.assert_called_once_with(
-            model="deepseek-flash", api_key="test-key", base_url="https://api.deepseek.com",
-            temperature=0, extra_body={"thinking": {"type": "disabled"}}, timeout=120, max_retries=2,
-        )
-
-    def test_deepseek_missing_key_stops_before_creating_client(self):
-        """缺少 DeepSeek 密钥时明确报错，不发起网络请求。"""
-        # 空密钥属于配置问题，保留系统级错误提示。
-        models.get_deepseek.cache_clear()
-        self.addCleanup(models.get_deepseek.cache_clear)
-        with patch.object(models, "load_dotenv"), patch.object(models.os, "getenv", return_value=""), \
-             patch.object(models, "ChatOpenAI") as client:
-            with self.assertRaisesRegex(RuntimeError, "DEEPSEEK_API_KEY"):
-                models.get_deepseek()
-        client.assert_not_called()
+    def test_chat_clients_preserve_options_keys_and_separate_caches(self):
+        """两家客户端共用构造，模型参数、密钥选择与独立缓存保持不变。"""
+        # 以同一组检查覆盖两个供应商，不读取真实密钥或发起请求。
+        for getter, model, key, url in (
+            (models.get_mimo, "mimo-v2.6-flash", "MIMO_API_KEY", "https://api.xiaomimimo.com/v1"),
+            (models.get_deepseek, "deepseek-flash", "DEEPSEEK_API_KEY", "https://api.deepseek.com"),
+        ):
+            getter.cache_clear()
+            self.addCleanup(getter.cache_clear)
+            with self.subTest(model=model), patch.object(models, "load_dotenv"), \
+                 patch.object(models.os, "getenv", return_value="test-key") as getenv, \
+                 patch.object(models, "ChatOpenAI") as client:
+                self.assertIs(getter(), client.return_value)
+                self.assertIs(getter(), client.return_value)
+                getenv.assert_called_once_with(key)
+                client.assert_called_once_with(
+                    model=model, api_key="test-key", base_url=url, temperature=0,
+                    extra_body={"thinking": {"type": "disabled"}}, timeout=120, max_retries=2,
+                )
+            # 配置缺失时仍在客户端构造前报错，不缓存失败结果。
+            getter.cache_clear()
+            with self.subTest(missing=key), patch.object(models, "load_dotenv"), \
+                 patch.object(models.os, "getenv", return_value=""), patch.object(models, "ChatOpenAI") as client:
+                with self.assertRaisesRegex(RuntimeError, key):
+                    getter()
+                client.assert_not_called()
 
     def test_llm_routes_only_to_selected_provider(self):
         """默认使用 MiMo；切换供应商时只构造对应客户端。"""
@@ -531,6 +519,23 @@ class PipelineTests(unittest.TestCase):
                     reranker.return_value.compress_documents.return_value = ranked
                     with self.assertLogs(retrieve.logger, level="WARNING"):
                         self.assertEqual([item["evidence_id"] for item in retrieve.retrieve("question")], ["good"])
+
+    def test_candidate_merge_keeps_first_block_and_original_order(self):
+        """合并去重仍保留首次命中的块；无 ID 时按证据标识和检索文字区分。"""
+        first, duplicate, original, variant, lexical = [document(key) for key in ("first", "first", "body", "body", "lexical")]
+        first.id = duplicate.id = "same-id"
+        duplicate.page_content = "duplicate text must not replace the first block"
+        variant.page_content = "another chunk of the same evidence"
+        with patch.object(retrieve, "get_vector_store") as store, \
+             patch.object(retrieve, "keyword_search", return_value=[duplicate, document("body"), lexical]), \
+             patch.object(retrieve, "get_reranker") as reranker, self.assertLogs(retrieve.logger):
+            store.return_value.similarity_search.return_value = [first, original, variant]
+            reranker.return_value.compress_documents.return_value = [first, original, variant, lexical]
+            result = retrieve.retrieve("question")
+            candidates = reranker.return_value.compress_documents.call_args.kwargs["documents"]
+        self.assertEqual(candidates, [first, original, variant, lexical])
+        self.assertIs(candidates[0], first)
+        self.assertEqual([record["evidence_id"] for record in result], ["first", "body", "lexical"])
 
     def test_decode_evidence_preserves_original_content_and_input(self):
         """只还原列表字段，原文、数值、来源及输入 metadata 保持不变。"""

@@ -151,7 +151,7 @@ uv run python -m wattbot.evaluate input/train_QA.csv artifacts/dev_baseline.csv
 
 离线回归检查：`uv run python -m unittest discover -s tests -v`。测试替换模型、解析器和索引，不调用 API、不下载模型、不改动现有索引；不代表全量论文或答案质量验证。
 
-本轮等价精简集中索引 metadata 解码、采用固定 Docling 文档接口、复用续表比较的 DataFrame，并合并图片任务提交与模型连接参数。保留图片描述缓存、三任务上限、局部回退、GPU 锁、断点恢复及提交输出契约；Prompt、原图附件预算和引用回退策略未改动，无需重建索引。
+代码精简集中在重复逻辑：统一索引 metadata 解码、复用续表 DataFrame、合并图片调度，以及共用客户端构造和全文查询。第二轮另合并召回去重状态、简化图片计数及提交字段组装；保留各供应商的独立缓存和原有接口。图片描述缓存、并发上限、局部回退、GPU 锁、断点恢复、Prompt、原图附件预算和输出契约均保留，无需重建索引。验证使用离线模拟，不代表答案准确率或 Kaggle 提分。
 
 本轮通用改动与小样边界见 [2026-10-03 质量优化记录](reports/quality_steps_20261003.md)；后续来源检查、表格原页与思考对照见 [小样验证记录](reports/source_table_reasoning_20261003.md)。
 
