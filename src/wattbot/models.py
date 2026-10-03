@@ -5,7 +5,9 @@ import logging
 import os
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 
+import pypdfium2 as pdfium
 import torch
 from dotenv import load_dotenv
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
@@ -24,6 +26,8 @@ KEYWORD_K = 60
 FINAL_TOP_K = 10
 RERANK_K = RETRIEVAL_K + KEYWORD_K
 logger = logging.getLogger(__name__)
+# PDFium 不支持多线程同时调用；只串行本地渲染，不阻塞远程模型请求。
+PAGE_RENDER_LOCK = Lock()
 
 
 @lru_cache(maxsize=1)
@@ -108,6 +112,34 @@ def get_reranker():
         model_kwargs={"device": "cuda"},
     )
     return CrossEncoderReranker(model=model, top_n=RERANK_K)
+
+
+def page_image(ref_id, page):
+    """按需渲染完整 PDF 原页；缓存随源文件修改时间变化，不调用 OCR 或 API。"""
+    pdf_path = PAPERS_DIR / f"{ref_id}.pdf"
+    try:
+        # 页码沿用 ingestion 的一基编号；只处理检索实际返回的页面。
+        if type(page) is not int or page < 1:
+            raise ValueError("无效页码")
+        modified = pdf_path.stat().st_mtime_ns
+        target = ARTIFACTS_DIR / ref_id / "pages" / f"{page}-{modified}-x2.png"
+        with PAGE_RENDER_LOCK:
+            if not target.exists() or not target.stat().st_size:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # 完整页面保留表头、标题、脚注和跨栏上下文，不按表格边界裁切。
+                with pdfium.PdfDocument(pdf_path) as doc:
+                    pdf_page = doc[page - 1]
+                    bitmap = pdf_page.render(scale=2)
+                    try:
+                        with bitmap.to_pil() as image:
+                            image.save(target)
+                    finally:
+                        bitmap.close()
+                        pdf_page.close()
+        return str(target.relative_to(ROOT))
+    except (OSError, ValueError, IndexError, pdfium.PdfiumError) as exc:
+        logger.warning("原页渲染失败 %s p%s，保留已有截图及文字：%s", ref_id, page, exc)
+        return None
 
 
 def image_block(image_path):

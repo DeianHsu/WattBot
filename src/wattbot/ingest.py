@@ -262,11 +262,47 @@ def get_caption(item, doc):
         return ""
 
 
-def element_contexts(doc):
+def element_notes(doc):
+    """按同页栏位和垂直距离收集邻近脚注，避免双栏页面串入另一栏。"""
+    # Docling 的脚注引用可能漏绑或跨栏；有版面时使用实际区域，不猜测脚注含义。
+    if not hasattr(doc, "texts"):
+        return {}
+    floating = [*doc.tables, *getattr(doc, "pictures", [])]
+    notes = {}
+    for note in doc.texts:
+        if note.label != DocItemLabel.FOOTNOTE or not note.text.strip():
+            continue
+        candidates = []
+        for item in floating:
+            for source in item.prov:
+                for location in note.prov:
+                    page = doc.pages.get(source.page_no)
+                    if source.page_no != location.page_no or page is None:
+                        continue
+                    # 全部转换成页面左上原点；按横向重叠判断栏位，容纳表格相对栏位的缩进。
+                    box = source.bbox.to_top_left_origin(page.size.height)
+                    point = location.bbox.to_top_left_origin(page.size.height)
+                    overlap = min(box.r, point.r) - max(box.l, point.l)
+                    width = min(box.r - box.l, point.r - point.l)
+                    if width > 0 and overlap >= width / 2 and point.t >= box.b - 2:
+                        candidates.append((max(0, point.t - box.b), item.self_ref))
+        if candidates:
+            owner = min(candidates)[1]
+            notes.setdefault(owner, []).append(note.text)
+        else:
+            # 无可靠版面时只沿用唯一的显式引用；缺失或歧义的脚注保持独立正文。
+            owners = [item.self_ref for item in floating if any(ref.cref == note.self_ref for ref in item.footnotes)]
+            if len(owners) == 1 and not any(location.page_no in doc.pages for location in note.prov):
+                notes.setdefault(owners[0], []).append(note.text)
+    return {key: "\n".join(dict.fromkeys(values)) for key, values in notes.items()}
+
+
+def element_contexts(doc, notes=None):
     """为图表收集章节及同页相关正文，不用模型生成或猜测上下文。"""
     # 测试桩或损坏文档没有阅读顺序时，保持原来的图题降级。
     if not hasattr(doc, "iterate_items"):
         return {}
+    notes = element_notes(doc) if notes is None else notes
     items = [item for item, _ in doc.iterate_items(included_content_layers={ContentLayer.BODY})]
     contexts, headings = {}, {}
     for number, item in enumerate(items):
@@ -286,12 +322,14 @@ def element_contexts(doc):
             nearby = [(abs(index - number), other.text) for index, other in enumerate(items)
                       if isinstance(getattr(other, "text", None), str) and other.text.strip()
                       and not isinstance(other, (TitleItem, SectionHeaderItem))
-                      and other.label != DocItemLabel.CAPTION
+                      and other.label not in (DocItemLabel.CAPTION, DocItemLabel.FOOTNOTE)
                       and not any(other.self_ref == ref.cref for ref in item.captions)
                       and pages & {p.page_no for p in other.prov}]
             nearby.sort(key=lambda pair: (not bool(reference and reference.search(pair[1])), pair[0]))
             contexts[item.self_ref] = "\n".join([
                 " / ".join(headings.values()), *(text for _, text in nearby[:2]),
+                ("Nearby original footnotes (match their markers to the table/caption/text):\n" + notes[item.self_ref])
+                if item.self_ref in notes else "",
             ]).strip()
     return contexts
 
@@ -316,26 +354,78 @@ def table_search_text(table, doc):
     # 使用 Docling 的 DataFrame 导出保留表头关系；不自行换算或推算任何数字。
     frame = table.export_to_dataframe(doc=doc)
     rows = list(frame.itertuples(index=False, name=None))
-    damaged = not rows or (len(rows) == 1 and sum(len(str(cell).split()) > 12 for cell in rows[0]) >= 2)
+    # 单行长描述可以是合法表格；多列长内容并含数值列表才触发疑似粘连回退。
+    long_cells = [str(cell) for cell in rows[0] if len(str(cell).split()) > 12] if len(rows) == 1 else []
+    damaged = not rows or (len(long_cells) >= 2 and any(
+        len(re.findall(r"\d+(?:\.\d+)?", cell)) >= 4 for cell in long_cells))
     text = "\n".join("; ".join(f"{column}: {cell}" for column, cell in zip(frame.columns, row))
                      for row in rows)
     return text, damaged
 
 
+def table_groups(doc):
+    """仅将表头一致、同栏分页且没有新表题的高置信续页归为一份证据。"""
+    items = [item for item, _ in doc.iterate_items(included_content_layers={ContentLayer.BODY})] if hasattr(doc, "iterate_items") else []
+    positions = {item.self_ref: number for number, item in enumerate(items)}
+    groups = []
+    for table in doc.tables:
+        join = False
+        if groups and table.prov and groups[-1][-1].prov:
+            previous = groups[-1][-1]
+            start = re.search(r"\bTable\s*(\w+)\b", get_caption(groups[-1][0], doc), re.I)
+            caption = get_caption(table, doc)
+            continued = start and re.search(rf"\bTable\s*{re.escape(start[1])}\b.*\bcontinued\b", caption, re.I)
+            old, new = previous.prov[-1], table.prov[0]
+            between = items[positions[previous.self_ref] + 1:positions[table.self_ref]] if previous.self_ref in positions and table.self_ref in positions else []
+            separated = any(isinstance(getattr(item, "text", None), str)
+                            and item.label not in (DocItemLabel.CAPTION, DocItemLabel.FOOTNOTE) for item in between)
+            page_a, page_b = getattr(doc, "pages", {}).get(old.page_no), getattr(doc, "pages", {}).get(new.page_no)
+            if start and not separated and (not caption or continued) and new.page_no == old.page_no + 1 and page_a and page_b:
+                # 无新表题时要求上一页末四分之一、下一页首四分之一，且栏位相同。
+                a = old.bbox.to_top_left_origin(page_a.size.height)
+                b = new.bbox.to_top_left_origin(page_b.size.height)
+                same_column = min(a.r, b.r) - max(a.l, b.l) >= min(a.r - a.l, b.r - b.l) / 2
+                if same_column and a.b >= page_a.size.height * .75 and b.t <= page_b.size.height * .25:
+                    try:
+                        # 对照原始多级列名及单位，不仅比较列数，也不继承新表的条件。
+                        first = [re.sub(r"\s+", " ", str(column)).strip().casefold()
+                                 for column in previous.export_to_dataframe(doc=doc).columns]
+                        second = [re.sub(r"\s+", " ", str(column)).strip().casefold()
+                                  for column in table.export_to_dataframe(doc=doc).columns]
+                        join = first == second and sum(bool(re.search(r"[^\W\d_]", column)) for column in first) >= 2
+                    except (ValueError, IndexError, KeyError, TypeError, AttributeError, RuntimeError) as exc:
+                        logger.warning("续表关系无法确认，保留独立表格 %s：%s", table.self_ref, exc)
+        if join:
+            groups[-1].append(table)
+        else:
+            groups.append([table])
+    return groups
+
+
 def get_text_chunks(doc, chunker, splitter):
     """正文同章节合并，图表保持独立；结构损坏时保留可用正文。"""
-    # 表格单独处理，不进入正文序列化；用原文阅读顺序保留图表的边界位置。
+    # 图表和脚注单独处理；正常分块、混合块及异常回退使用相同的正文过滤。
+    excluded = {DocItemLabel.TABLE, DocItemLabel.DOCUMENT_INDEX, DocItemLabel.PICTURE,
+                DocItemLabel.FOOTNOTE, DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER}
+
+    def is_body(item):
+        """仅保留正文元素，防止独立脚注或页眉页脚被回退流程重复加入。"""
+        return (getattr(item, "label", None) not in excluded
+                and getattr(item, "content_layer", ContentLayer.BODY) == ContentLayer.BODY
+                and not getattr(item, "self_ref", "").startswith(("#/tables/", "#/pictures/")))
+
+    # 用原文阅读顺序保留图表边界，不跨表格合并其两侧正文。
     floating = {item.self_ref for item in [*doc.tables, *getattr(doc, "pictures", [])]}
     order = ({item.self_ref: number for number, (item, _) in enumerate(doc.iterate_items())}
              if hasattr(doc, "iterate_items") else {})
     boundaries = [order[key] for key in floating if key in order]
     try:
-        chunks = list(chunker.chunk(dl_doc=doc, labels=set(DocItemLabel) - {
-            DocItemLabel.TABLE, DocItemLabel.DOCUMENT_INDEX, DocItemLabel.PICTURE,
-        }))
+        chunks = list(chunker.chunk(dl_doc=doc, labels=set(DocItemLabel) - excluded))
     except (ValueError, IndexError, KeyError, TypeError) as exc:
         logger.warning("结构化分块失败，回退到逐元素文本分块：%s", exc)
         for item in doc.texts:
+            if not is_body(item):
+                continue
             for part in splitter.split_text(item.text):
                 yield part, [item]
         return
@@ -357,13 +447,13 @@ def get_text_chunks(doc, chunker, splitter):
                 yield pending, sources
                 pending, sources, previous = "", [], None
             last = max(positions)
-        if any(isinstance(item, (TableItem, PictureItem)) or item.self_ref.startswith(("#/tables/", "#/pictures/")) for item in items):
+        if any(not is_body(item) for item in items):
             if pending:
                 yield pending, sources
             pending, sources, previous = "", [], None
-            # 混合元素块中仍可能有正文；逐项保留，不能随图表一起跳过。
+            # 混合块中的正文逐项保留；脚注由独立流程处理，不重复序列化。
             for item in items:
-                if not isinstance(item, (TableItem, PictureItem)) and isinstance(getattr(item, "text", None), str):
+                if is_body(item) and isinstance(getattr(item, "text", None), str):
                     for part in splitter.split_text(item.text):
                         yield part, [item]
             continue
@@ -408,7 +498,8 @@ def ingest_pdf(pdf_path):
     # 图表使用同页原文上下文；正文和表格分别处理，避免合并后丢失证据类型。
     stage_started = perf_counter()
     print(f"[{ref_id}] 开始正文/表格分块与表格截图导出", flush=True)
-    contexts = element_contexts(doc)
+    notes = element_notes(doc)
+    contexts = element_contexts(doc, notes)
     chunker = get_chunker()
     splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
         chunker.tokenizer.get_tokenizer(), chunk_size=400, chunk_overlap=40
@@ -417,31 +508,50 @@ def ingest_pdf(pdf_path):
         if text.strip():
             documents.append(make_document(text, ref_id, f"text:{number}", "text", items, text))
 
+    # 每条已识别脚注显式入库，不依赖图表关联或分块器；长脚注共用 ID 并保留完整原文。
+    for note in getattr(doc, "texts", []):
+        if note.label == DocItemLabel.FOOTNOTE and note.text.strip():
+            for text in splitter.split_text(note.text):
+                documents.append(make_document(
+                    text, ref_id, f"footnote:{note.self_ref}", "text", [note], note.text
+                ))
+
     # 按整行构造检索文本，metadata 保留完整表格；异常转写只参与召回。
-    for table in doc.tables:
-        caption = get_caption(table, doc)
-        context = contexts.get(table.self_ref, "")
-        images = save_item_images(table, doc, output_dir)
-        content, search, damaged = "", "", True
-        try:
-            content = table.export_to_markdown(doc=doc)
-            search, damaged = table_search_text(table, doc)
-        except (ValueError, IndexError, KeyError, TypeError, AttributeError, RuntimeError) as exc:
-            logger.warning("表格结构不可用，回退到原图 %s %s：%s", ref_id, table.self_ref, exc)
-        if damaged:
-            logger.warning("表格结构为空或疑似多行粘连，检索转写不作原文：%s %s", ref_id, table.self_ref)
-            if not images:
-                logger.warning("异常表格也没有截图，跳过该表，保留其他证据：%s %s", ref_id, table.self_ref)
-                continue
-            search = describe_picture(images, caption, context, kind="table") or search or content
-            content = f"{caption}\nTable text extraction is unreliable; read the attached original table images."
-        else:
-            # Markdown 中表题和脚注保持原文，行级序列化不丢掉这些限制条件。
-            notes = "\n".join(line for line in content.splitlines() if not line.lstrip().startswith("|"))
-            search = f"{search}\n{notes}"
-        for text in split_search_text(search, f"{caption}\n{context}", chunker.tokenizer):
+    for group in table_groups(doc):
+        searches, contents, images, sources = [], [], [], []
+        caption = get_caption(group[0], doc)
+        for table in group:
+            context = contexts.get(table.self_ref, "")
+            paths = save_item_images(table, doc, output_dir)
+            content, search, damaged = "", "", True
+            try:
+                content = table.export_to_markdown(doc=doc)
+                search, damaged = table_search_text(table, doc)
+            except (ValueError, IndexError, KeyError, TypeError, AttributeError, RuntimeError) as exc:
+                logger.warning("表格结构不可用，回退到原图 %s %s：%s", ref_id, table.self_ref, exc)
+            if damaged:
+                logger.warning("表格结构为空或疑似多行粘连，检索转写不作原文：%s %s", ref_id, table.self_ref)
+                if not paths:
+                    logger.warning("异常表格也没有截图，跳过该部分，保留其他证据：%s %s", ref_id, table.self_ref)
+                    continue
+                search = describe_picture(paths, get_caption(table, doc) or caption, context, kind="table") or search or content
+                content = f"{caption}\nTable text extraction is unreliable; read the attached original table images."
+            else:
+                # 表题和脚注保持原文，行级序列化不丢掉这些限制条件。
+                original_notes = "\n".join(line for line in content.splitlines() if not line.lstrip().startswith("|"))
+                search = f"{search}\n{original_notes}"
+            # 脚注进入检索正文，不受短前缀预算截断；每部分保持自己的原图和原文。
+            searches.append(f"{search}\n{notes.get(table.self_ref, '')}".strip())
+            contents.append(f"{context}\n{content}".strip())
+            images.extend(paths)
+            sources.append(table)
+        if not sources:
+            continue
+        # 续表共享首部分的 evidence_id；原始行列不重算，完整证据包含所有来源页。
+        context = contexts.get(group[0].self_ref, "")
+        for text in split_search_text("\n\n".join(searches), f"{caption}\n{context}", chunker.tokenizer):
             documents.append(make_document(
-                text, ref_id, table.self_ref, "table", [table], f"{context}\n{content}".strip(), images
+                text, ref_id, group[0].self_ref, "table", sources, "\n\n".join(contents), images
             ))
 
     print(f"[{ref_id}] 正文/表格处理完成：{len(documents)} 个块，"
@@ -475,7 +585,8 @@ def ingest_pdf(pdf_path):
         if not (caption + description + context).strip():
             logger.warning("图片无可用检索文字，跳过：%s %s", ref_id, picture.self_ref)
             continue
-        for text in split_search_text(description or caption, f"{caption}\n{context}", chunker.tokenizer):
+        search = f"{description or caption}\n{notes.get(picture.self_ref, '')}".strip()
+        for text in split_search_text(search, f"{caption}\n{context}", chunker.tokenizer):
             documents.append(make_document(
                 text, ref_id, picture.self_ref, "image", [picture], f"{caption}\n{context}".strip(), images
             ))
