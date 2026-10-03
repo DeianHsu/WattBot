@@ -78,6 +78,24 @@ def keyword_search(question, store, entities=()):
     return [documents[key] for key in ids if key in documents]
 
 
+def decode_evidence(metadata):
+    """在索引读取边界还原原始证据，不修改存储的 metadata。"""
+    # 自产索引的页码和图片路径为 JSON 列表；损坏记录由调用方告警并跳过。
+    record = dict(metadata)
+    for key in ("pages", "image_paths"):
+        record[key] = json.loads(record.get(key, "[]"))
+        if not isinstance(record[key], list):
+            raise ValueError(f"{key} 不是列表")
+    if not all(isinstance(path, str) for path in record["image_paths"]):
+        raise ValueError("图片路径不是文本")
+    record.setdefault("content", "")
+    if not all(record[key].strip() for key in ("evidence_id", "ref_id", "modality")):
+        raise ValueError("缺少证据标识或来源")
+    if not (record["content"].strip() or record["image_paths"]):
+        raise ValueError("原始证据为空")
+    return record
+
+
 def retrieve(question: str, ref_ids=None, *, entities=()):
     """返回全部重排、去重候选；最终 Top-K 统一由事实融合选择。"""
     # 两种检索使用同一批正文、表格文本和图片描述；先合并候选，再统一重排。
@@ -105,26 +123,10 @@ def retrieve(question: str, ref_ids=None, *, entities=()):
     # 按重排顺序保留每份证据的最高排名块，去重后才计算最终 Top-K 名额。
     evidence = {}
     for doc in ranked:
-        record = dict(doc.metadata)
         try:
-            if not all(isinstance(record.get(key), str) and record[key].strip()
-                       for key in ("evidence_id", "ref_id", "modality")):
-                raise ValueError("缺少证据标识或来源")
-            if record["evidence_id"] in evidence:
-                continue
-            record["pages"] = json.loads(record.get("pages", "[]"))
-            record["image_paths"] = json.loads(record.get("image_paths", "[]"))
-            if (not isinstance(record["pages"], list)
-                    or not isinstance(record["image_paths"], list)
-                    or not all(isinstance(path, str) for path in record["image_paths"])):
-                raise ValueError("页码或图片路径格式错误")
-            record["content"] = record.get("content", "")
-            if not isinstance(record["content"], str):
-                raise ValueError("原始证据内容不是文本")
-            if not record["content"].strip() and not record["image_paths"]:
-                raise ValueError("原始证据为空")
-        except (ValueError, TypeError) as exc:
-            logger.warning("跳过异常检索记录 %s：%s", record.get("evidence_id"), exc)
+            record = decode_evidence(doc.metadata)
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
+            logger.warning("跳过异常检索记录 %s：%s", doc.metadata.get("evidence_id"), exc)
             continue
         evidence.setdefault(record["evidence_id"], record)
     if len(evidence) < FINAL_TOP_K:
@@ -189,9 +191,10 @@ def read_neighbors(evidence_id):
     records = {}
     for metadata in data["metadatas"]:
         try:
-            record = {**metadata, "pages": json.loads(metadata["pages"]), "image_paths": []}
+            record = decode_evidence(metadata)
             if record["modality"] != "text" or not record["content"].strip():
                 continue
+            record["image_paths"] = []
             records[record["evidence_id"]] = record
         except (KeyError, ValueError, TypeError, AttributeError) as exc:
             logger.warning("相邻正文块不可用，跳过该块：%s", exc)

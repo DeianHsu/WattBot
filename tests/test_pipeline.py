@@ -14,6 +14,7 @@ from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from docling_core.types.doc import DoclingDocument, TableData
 from langchain_core.documents import Document
 from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import PydanticOutputParser
@@ -517,14 +518,39 @@ class PipelineTests(unittest.TestCase):
 
     def test_bad_record_skipped_and_short_result_allowed(self):
         """损坏记录不占名额，证据不足时不重复填充。"""
-        bad = document("bad")
-        bad.metadata["pages"] = "invalid JSON"
-        ranked = [bad, document("good"), document("good")]
-        with patch.object(retrieve, "get_vector_store") as store, patch.object(retrieve, "keyword_search", return_value=[]), patch.object(retrieve, "get_reranker") as reranker:
-            store.return_value.similarity_search.return_value = ranked
-            reranker.return_value.compress_documents.return_value = ranked
-            with self.assertLogs(retrieve.logger, level="WARNING"):
-                self.assertEqual(len(retrieve.retrieve("question")), 1)
+        for fields in ({"pages": "invalid JSON"}, {"pages": "{}"},
+                       {"image_paths": "[1]"}, {"image_paths": "null"},
+                       {"ref_id": None}, {"evidence_id": " "},
+                       {"content": 42}, {"content": ""}):
+            with self.subTest(fields=fields):
+                bad = document("bad")
+                bad.metadata.update(fields)
+                ranked = [bad, document("good"), document("good")]
+                with patch.object(retrieve, "get_vector_store") as store, patch.object(retrieve, "keyword_search", return_value=[]), patch.object(retrieve, "get_reranker") as reranker:
+                    store.return_value.similarity_search.return_value = ranked
+                    reranker.return_value.compress_documents.return_value = ranked
+                    with self.assertLogs(retrieve.logger, level="WARNING"):
+                        self.assertEqual([item["evidence_id"] for item in retrieve.retrieve("question")], ["good"])
+
+    def test_decode_evidence_preserves_original_content_and_input(self):
+        """只还原列表字段，原文、数值、来源及输入 metadata 保持不变。"""
+        metadata = {**document("table").metadata, "pages": "[1, 2]",
+                    "image_paths": '["first.png", "second.png"]',
+                    "content": "Model-A: 0.00420 Wh; original footnote."}
+        record = retrieve.decode_evidence(metadata)
+        self.assertEqual(record, {**metadata, "pages": [1, 2], "image_paths": ["first.png", "second.png"]})
+        self.assertEqual(metadata["pages"], "[1, 2]")
+        self.assertEqual(metadata["image_paths"], '["first.png", "second.png"]')
+        self.assertEqual(retrieve.decode_evidence({**metadata, "content": ""})["content"], "")
+
+    def test_neighbor_metadata_failure_keeps_other_original_blocks(self):
+        """相邻块与召回复用格式边界，坏块跳过且不影响可用原文。"""
+        bad = {**document("a:text:9").metadata, "modality": "text", "pages": "broken"}
+        good = {**document("a:text:11").metadata, "modality": "text", "content": "Original 2.500 Wh."}
+        with patch.object(retrieve, "get_vector_store") as store, self.assertLogs(retrieve.logger):
+            store.return_value.get.return_value = {"metadatas": [bad, good]}
+            result = read_neighbors("a:text:10")
+        self.assertEqual(result, [{**good, "pages": [1], "image_paths": []}])
 
     def test_empty_index_still_raises(self):
         """空索引属于系统级错误，不生成伪答案。"""
@@ -902,12 +928,12 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("unresolved_conflict", draft.model_dump())
 
     def test_independent_chart_reading_binds_actual_source(self):
-        """单图阅读只附当前图片，模型抄错来源时由程序覆盖。"""
+        """单图阅读只附当前图片，来源由程序绑定，不要求模型生成 ID。"""
         records = [{**document(key).metadata, "ref_id": "paper", "modality": "image",
                     "pages": [1], "image_paths": [f"{key}.png"]}
                    for key in ("first", "second")]
         reading = generate.NumericFact(value=2, unit="seconds", conditions="stacked total",
-                                        evidence_id="wrong", matches_question=True)
+                                        matches_question=True)
         with patch.object(generate, "image_block", return_value={"type": "image_url"}) as image, patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.invoke.return_value = generate.ChartReadings(readings=[reading])
@@ -945,14 +971,13 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("layers 2 seconds", result["explanation"])
 
     def test_chart_coordinator_decision_is_not_overwritten(self):
-        """独立 reader 的局部读数经协调排除后，不重新变为匹配的总计。"""
+        """独立读图的局部条件仅供模型参考，程序保留最终答案。"""
         evidence = [{**document(key).metadata, "modality": "image", "pages": [1],
                      "image_paths": [f"{key}.png"]} for key in ("whole", "kernel")]
         raw = [{**generate.NumericFact(value=value, unit="seconds", conditions="candidate",
-                    matches_question=True).model_dump(), "evidence_id": key}
+                    matches_question=key == "whole").model_dump(), "evidence_id": key}
                for key, value in (("whole", 2), ("kernel", .002))]
-        final = generate.AnswerDraft(answer_value=2, unresolved_conflict=True,
-            visual_readings=[{**raw[0]}, {**raw[1], "matches_question": False, "conditions": "individual kernel"}])
+        final = generate.AnswerDraft(answer_value=2)
         with patch.object(generate, "image_block", return_value={"type": "image_url"}), patch.object(generate, "get_llm") as mimo:
             model = mimo.return_value.with_structured_output.return_value
             model.bind.return_value = model
@@ -999,14 +1024,11 @@ class PipelineTests(unittest.TestCase):
         image.assert_not_called()
         self.assertEqual(result["answer_value"], 42)
 
-    def test_visual_check_uses_only_attached_images(self):
-        """图像标签绑定实际附件，程序不根据图表标记改写核心答案。"""
+    def test_image_labels_follow_actual_attachments(self):
+        """图像标签绑定实际附件，局部图片缺失不改写模型答案。"""
         evidence = [{**document(key).metadata, "pages": [1], "image_paths": [f"{key}.png"]}
                     for key in ("first", "second")]
-        readings = [generate.NumericFact(value=value, unit="seconds", conditions="target total",
-                                        evidence_id=key, matches_question=True)
-                    for key, value in (("first", "2.7"), ("second", "2"))]
-        draft = generate.AnswerDraft(answer_value="2.7", visual_readings=readings, unresolved_conflict=True)
+        draft = generate.AnswerDraft(answer_value="2.7")
         for blocks, expected in (([{"type": "image_url"}] * 2, "2.7"),
                                   ([{"type": "image_url"}, None], "2.7")):
             with self.subTest(expected=expected), patch.object(generate, "image_block", side_effect=blocks), patch.object(generate, "get_llm") as mimo:
@@ -1106,8 +1128,8 @@ class PipelineTests(unittest.TestCase):
         """结构化分块损坏后保留已解析的正文。"""
         chunker = Mock()
         chunker.chunk.side_effect = ValueError("bad table structure")
-        item = SimpleNamespace(text="original text")
-        doc = SimpleNamespace(texts=[item], tables=[])
+        doc = DoclingDocument(name="offline-fixture")
+        item = doc.add_text(label=ingest.DocItemLabel.TEXT, text="original text")
         splitter = Mock()
         splitter.split_text.side_effect = lambda text: [text]
         with self.assertLogs(ingest.logger):
@@ -1115,32 +1137,23 @@ class PipelineTests(unittest.TestCase):
 
     def test_partial_pdf_and_missing_picture_continue(self):
         """部分解析成功、无截图且无图题时，仍保留正文。"""
-        picture = Mock()
-        picture.self_ref = "#/pictures/0"
-        picture.content_layer = ingest.ContentLayer.BODY
-        picture.caption_text.return_value = ""
-        item = SimpleNamespace(prov=[SimpleNamespace(page_no=1)])
-        result = SimpleNamespace(status=ingest.ConversionStatus.PARTIAL_SUCCESS,
-                                 document=SimpleNamespace(tables=[], pictures=[picture]))
+        doc = DoclingDocument(name="offline-fixture")
+        doc.add_picture()
+        item = doc.add_text(label=ingest.DocItemLabel.TEXT, text="text")
+        result = SimpleNamespace(status=ingest.ConversionStatus.PARTIAL_SUCCESS, document=doc)
         with tempfile.TemporaryDirectory() as directory, patch.object(ingest, "ARTIFACTS_DIR", Path(directory)), patch.object(ingest, "get_converter") as converter, patch.object(ingest, "get_chunker"), patch.object(ingest.RecursiveCharacterTextSplitter, "from_huggingface_tokenizer"), patch.object(ingest, "get_text_chunks", return_value=[("text", [item])]), patch.object(ingest, "save_item_images", return_value=[]), self.assertLogs(ingest.logger):
             converter.return_value.convert.return_value = result
             self.assertEqual(len(ingest.ingest_pdf("paper.pdf")), 1)
 
     def test_only_body_pictures_are_exported_and_described(self):
         """非正文图片不导出、不调用描述；无图题的正文图片仍保留。"""
-        pictures = [
-            SimpleNamespace(self_ref="#/pictures/0", content_layer=ingest.ContentLayer.BODY,
-                            prov=[SimpleNamespace(page_no=1)], caption_text=Mock(return_value="Figure 1")),
-            SimpleNamespace(self_ref="#/pictures/1", content_layer=ingest.ContentLayer.BODY,
-                            prov=[SimpleNamespace(page_no=2)], caption_text=Mock(return_value="")),
-            SimpleNamespace(self_ref="#/pictures/2", content_layer=ingest.ContentLayer.FURNITURE,
-                            prov=[SimpleNamespace(page_no=2)], caption_text=Mock(return_value="logo")),
-            SimpleNamespace(self_ref="#/pictures/3", content_layer=ingest.ContentLayer.BACKGROUND,
-                            prov=[SimpleNamespace(page_no=2)], caption_text=Mock(return_value="")),
-        ]
-        doc = SimpleNamespace(tables=[], pictures=pictures)
+        doc = DoclingDocument(name="offline-fixture")
+        for layer, title in ((ingest.ContentLayer.BODY, "Figure 1"), (ingest.ContentLayer.BODY, ""),
+                             (ingest.ContentLayer.FURNITURE, "logo"), (ingest.ContentLayer.BACKGROUND, "")):
+            caption = doc.add_text(label=ingest.DocItemLabel.CAPTION, text=title) if title else None
+            doc.add_picture(content_layer=layer, caption=caption)
         result = SimpleNamespace(status=ingest.ConversionStatus.SUCCESS, document=doc)
-        text_item = SimpleNamespace(prov=[SimpleNamespace(page_no=1)])
+        text_item = doc.add_text(label=ingest.DocItemLabel.TEXT, text="text")
         with tempfile.TemporaryDirectory() as directory, patch.object(ingest, "ARTIFACTS_DIR", Path(directory)), patch.object(ingest, "get_converter") as converter, patch.object(ingest, "get_chunker"), patch.object(ingest.RecursiveCharacterTextSplitter, "from_huggingface_tokenizer") as splitter_factory, patch.object(ingest, "split_search_text", side_effect=lambda text, prefix, tokenizer: [text]), patch.object(ingest, "get_text_chunks", return_value=[("text", [text_item])]), patch.object(ingest, "save_item_images", return_value=["body.png"]) as export, patch.object(ingest, "describe_pictures", return_value=["first", "second"]) as describe:
             converter.return_value.convert.return_value = result
             splitter_factory.return_value.split_text.side_effect = lambda text: [text]
@@ -1159,13 +1172,10 @@ class PipelineTests(unittest.TestCase):
 
     def test_table_export_failure_keeps_original_image(self):
         """表格导出失败时保留原图，检索转写不进入原始证据字段。"""
-        table = Mock(spec=ingest.TableItem)
-        table.self_ref = "#/tables/0"
-        table.prov = [SimpleNamespace(page_no=1)]
-        table.export_to_markdown.side_effect = ValueError("bad cells")
-        result = SimpleNamespace(status=ingest.ConversionStatus.SUCCESS,
-                                 document=SimpleNamespace(tables=[table], pictures=[]))
-        with tempfile.TemporaryDirectory() as directory, patch.object(ingest, "ARTIFACTS_DIR", Path(directory)), patch.object(ingest, "get_converter") as converter, patch.object(ingest, "get_chunker"), patch.object(ingest.RecursiveCharacterTextSplitter, "from_huggingface_tokenizer"), patch.object(ingest, "split_search_text", side_effect=lambda text, prefix, tokenizer: [text]), patch.object(ingest, "get_text_chunks", return_value=[]), patch.object(ingest, "describe_picture", return_value="retrieval transcription"), patch.object(ingest, "save_item_images", return_value=["table.png"]), self.assertLogs(ingest.logger):
+        doc = DoclingDocument(name="offline-fixture")
+        table = doc.add_table(data=TableData(num_rows=1, num_cols=1, table_cells=[]))
+        result = SimpleNamespace(status=ingest.ConversionStatus.SUCCESS, document=doc)
+        with tempfile.TemporaryDirectory() as directory, patch.object(ingest, "ARTIFACTS_DIR", Path(directory)), patch.object(ingest, "get_converter") as converter, patch.object(ingest, "get_chunker"), patch.object(ingest.RecursiveCharacterTextSplitter, "from_huggingface_tokenizer"), patch.object(ingest, "split_search_text", side_effect=lambda text, prefix, tokenizer: [text]), patch.object(ingest, "get_text_chunks", return_value=[]), patch.object(type(table), "export_to_markdown", side_effect=ValueError("bad cells")), patch.object(ingest, "describe_picture", return_value="retrieval transcription"), patch.object(ingest, "save_item_images", return_value=["table.png"]), self.assertLogs(ingest.logger):
             converter.return_value.convert.return_value = result
             records = ingest.ingest_pdf("paper.pdf")
         self.assertIn("unreliable", records[0].metadata["content"])

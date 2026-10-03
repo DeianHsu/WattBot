@@ -210,11 +210,16 @@ def describe_pictures(jobs, ref_id):
     pool = ThreadPoolExecutor(max_workers=PICTURE_WORKERS)
     pending = {}
     try:
-        for _ in range(min(PICTURE_WORKERS, len(pending_jobs))):
-            numbers = next(iterator)
-            _, images, caption, context = jobs[numbers[0]]
-            pending[pool.submit(describe_picture, images, caption, context)] = numbers
-        while pending:
+        while True:
+            # 首次启动与完成后补充共用此处，始终保持在途任务不超过上限。
+            for _ in range(PICTURE_WORKERS - len(pending)):
+                numbers = next(iterator, None)
+                if numbers is None:
+                    break
+                _, images, caption, context = jobs[numbers[0]]
+                pending[pool.submit(describe_picture, images, caption, context)] = numbers
+            if not pending:
+                break
             done, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in done:
                 numbers = pending.pop(future)
@@ -224,12 +229,6 @@ def describe_pictures(jobs, ref_id):
                 completed += len(numbers)
                 print(f"[{ref_id}] 图片描述：{completed}/{len(jobs)}，"
                       f"本组生成/回退完成，已用 {perf_counter() - started:.1f}s", flush=True)
-            for _ in done:
-                numbers = next(iterator, None)
-                if numbers is None:
-                    break
-                _, images, caption, context = jobs[numbers[0]]
-                pending[pool.submit(describe_picture, images, caption, context)] = numbers
     finally:
         # 已发送的请求无法撤销，等待在途任务结束；系统异常原样向上抛出。
         pool.shutdown(wait=True, cancel_futures=True)
@@ -265,9 +264,7 @@ def get_caption(item, doc):
 def element_notes(doc):
     """按同页栏位和垂直距离收集邻近脚注，避免双栏页面串入另一栏。"""
     # Docling 的脚注引用可能漏绑或跨栏；有版面时使用实际区域，不猜测脚注含义。
-    if not hasattr(doc, "texts"):
-        return {}
-    floating = [*doc.tables, *getattr(doc, "pictures", [])]
+    floating = [*doc.tables, *doc.pictures]
     notes = {}
     for note in doc.texts:
         if note.label != DocItemLabel.FOOTNOTE or not note.text.strip():
@@ -299,9 +296,7 @@ def element_notes(doc):
 
 def element_contexts(doc, notes=None):
     """为图表收集章节及同页相关正文，不用模型生成或猜测上下文。"""
-    # 测试桩或损坏文档没有阅读顺序时，保持原来的图题降级。
-    if not hasattr(doc, "iterate_items"):
-        return {}
+    # Docling 文档提供固定的阅读顺序接口；具体元素缺失仍按原有规则处理。
     notes = element_notes(doc) if notes is None else notes
     items = [item for item, _ in doc.iterate_items(included_content_layers={ContentLayer.BODY})]
     contexts, headings = {}, {}
@@ -349,10 +344,10 @@ def split_search_text(text, prefix, tokenizer):
     return [f"{prefix}\n{part}".strip() for part in splitter.split_text(text or prefix)]
 
 
-def table_search_text(table, doc):
+def table_search_text(table, doc, frame=None):
     """按原表行与多级列名构造检索文字，并标记疑似整列粘连的结构。"""
     # 使用 Docling 的 DataFrame 导出保留表头关系；不自行换算或推算任何数字。
-    frame = table.export_to_dataframe(doc=doc)
+    frame = table.export_to_dataframe(doc=doc) if frame is None else frame
     rows = list(frame.itertuples(index=False, name=None))
     # 单行长描述可以是合法表格；多列长内容并含数值列表才触发疑似粘连回退。
     long_cells = [str(cell) for cell in rows[0] if len(str(cell).split()) > 12] if len(rows) == 1 else []
@@ -363,9 +358,19 @@ def table_search_text(table, doc):
     return text, damaged
 
 
-def table_groups(doc):
+def table_groups(doc, frames=None):
     """仅将表头一致、同栏分页且没有新表题的高置信续页归为一份证据。"""
-    items = [item for item, _ in doc.iterate_items(included_content_layers={ContentLayer.BODY})] if hasattr(doc, "iterate_items") else []
+    # 仅在本篇 PDF 内复用成功导出的表格；失败不缓存，后续单表仍可重试。
+    frames = {} if frames is None else frames
+
+    def columns(table):
+        """复用原始 DataFrame，以相同规则整理多级列名及单位。"""
+        if table.self_ref not in frames:
+            frames[table.self_ref] = table.export_to_dataframe(doc=doc)
+        return [re.sub(r"\s+", " ", str(column)).strip().casefold()
+                for column in frames[table.self_ref].columns]
+
+    items = [item for item, _ in doc.iterate_items(included_content_layers={ContentLayer.BODY})]
     positions = {item.self_ref: number for number, item in enumerate(items)}
     groups = []
     for table in doc.tables:
@@ -379,7 +384,7 @@ def table_groups(doc):
             between = items[positions[previous.self_ref] + 1:positions[table.self_ref]] if previous.self_ref in positions and table.self_ref in positions else []
             separated = any(isinstance(getattr(item, "text", None), str)
                             and item.label not in (DocItemLabel.CAPTION, DocItemLabel.FOOTNOTE) for item in between)
-            page_a, page_b = getattr(doc, "pages", {}).get(old.page_no), getattr(doc, "pages", {}).get(new.page_no)
+            page_a, page_b = doc.pages.get(old.page_no), doc.pages.get(new.page_no)
             if start and not separated and (not caption or continued) and new.page_no == old.page_no + 1 and page_a and page_b:
                 # 无新表题时要求上一页末四分之一、下一页首四分之一，且栏位相同。
                 a = old.bbox.to_top_left_origin(page_a.size.height)
@@ -388,10 +393,7 @@ def table_groups(doc):
                 if same_column and a.b >= page_a.size.height * .75 and b.t <= page_b.size.height * .25:
                     try:
                         # 对照原始多级列名及单位，不仅比较列数，也不继承新表的条件。
-                        first = [re.sub(r"\s+", " ", str(column)).strip().casefold()
-                                 for column in previous.export_to_dataframe(doc=doc).columns]
-                        second = [re.sub(r"\s+", " ", str(column)).strip().casefold()
-                                  for column in table.export_to_dataframe(doc=doc).columns]
+                        first, second = columns(previous), columns(table)
                         join = first == second and sum(bool(re.search(r"[^\W\d_]", column)) for column in first) >= 2
                     except (ValueError, IndexError, KeyError, TypeError, AttributeError, RuntimeError) as exc:
                         logger.warning("续表关系无法确认，保留独立表格 %s：%s", table.self_ref, exc)
@@ -415,9 +417,8 @@ def get_text_chunks(doc, chunker, splitter):
                 and not getattr(item, "self_ref", "").startswith(("#/tables/", "#/pictures/")))
 
     # 用原文阅读顺序保留图表边界，不跨表格合并其两侧正文。
-    floating = {item.self_ref for item in [*doc.tables, *getattr(doc, "pictures", [])]}
-    order = ({item.self_ref: number for number, (item, _) in enumerate(doc.iterate_items())}
-             if hasattr(doc, "iterate_items") else {})
+    floating = {item.self_ref for item in [*doc.tables, *doc.pictures]}
+    order = {item.self_ref: number for number, (item, _) in enumerate(doc.iterate_items())}
     boundaries = [order[key] for key in floating if key in order]
     try:
         chunks = list(chunker.chunk(dl_doc=doc, labels=set(DocItemLabel) - excluded))
@@ -509,7 +510,7 @@ def ingest_pdf(pdf_path):
             documents.append(make_document(text, ref_id, f"text:{number}", "text", items, text))
 
     # 每条已识别脚注显式入库，不依赖图表关联或分块器；长脚注共用 ID 并保留完整原文。
-    for note in getattr(doc, "texts", []):
+    for note in doc.texts:
         if note.label == DocItemLabel.FOOTNOTE and note.text.strip():
             for text in splitter.split_text(note.text):
                 documents.append(make_document(
@@ -517,7 +518,8 @@ def ingest_pdf(pdf_path):
                 ))
 
     # 按整行构造检索文本，metadata 保留完整表格；异常转写只参与召回。
-    for group in table_groups(doc):
+    frames = {}
+    for group in table_groups(doc, frames):
         searches, contents, images, sources = [], [], [], []
         caption = get_caption(group[0], doc)
         for table in group:
@@ -526,7 +528,7 @@ def ingest_pdf(pdf_path):
             content, search, damaged = "", "", True
             try:
                 content = table.export_to_markdown(doc=doc)
-                search, damaged = table_search_text(table, doc)
+                search, damaged = table_search_text(table, doc, frames.get(table.self_ref))
             except (ValueError, IndexError, KeyError, TypeError, AttributeError, RuntimeError) as exc:
                 logger.warning("表格结构不可用，回退到原图 %s %s：%s", ref_id, table.self_ref, exc)
             if damaged:

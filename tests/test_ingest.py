@@ -381,6 +381,30 @@ class IngestTests(unittest.TestCase):
         second.captions = [caption.get_ref()]
         self.assertEqual(ingest.table_groups(doc), [[first], [second]])
 
+    def test_continuation_frames_are_reused_without_changing_row_text(self):
+        """续表判断与行级序列化共享导出结果，列名、单位和数值保持不变。"""
+        doc, first, second = continuation_fixture()
+        expected = [ingest.table_search_text(table, doc) for table in (first, second)]
+        frames = {}
+        original = type(first).export_to_dataframe
+        with patch.object(type(first), "export_to_dataframe", autospec=True, side_effect=original) as export:
+            self.assertEqual(ingest.table_groups(doc, frames), [[first, second]])
+            actual = [ingest.table_search_text(table, doc, frames[table.self_ref]) for table in (first, second)]
+        self.assertEqual(actual, expected)
+        self.assertEqual(export.call_count, 2)
+
+    def test_failed_frame_export_is_not_cached(self):
+        """表头导出失败不缓存错误，正常单表序列化仍可以重新导出。"""
+        doc, first, second = continuation_fixture()
+        expected = first.export_to_dataframe(doc=doc)
+        frames = {}
+        with patch.object(type(first), "export_to_dataframe", side_effect=[ValueError("bad header"), expected]) as export:
+            with self.assertLogs(ingest.logger):
+                self.assertEqual(ingest.table_groups(doc, frames), [[first], [second]])
+            self.assertNotIn(first.self_ref, frames)
+            self.assertIn("2.500", ingest.table_search_text(first, doc, frames.get(first.self_ref))[0])
+        self.assertEqual(export.call_count, 2)
+
     def test_continuation_requires_caption_layout_headers_and_no_new_body(self):
         """缺少身份、栏位或单位一致性时不拼接，新正文也会中止续表推断。"""
         for variant in ("no_caption", "middle", "column", "unit", "page_gap", "new_body"):
@@ -439,6 +463,41 @@ class IngestTests(unittest.TestCase):
         with patch.object(ingest, "inspect_picture", return_value=((1, "same"), False)), patch.object(ingest, "read_description_cache", return_value=None), patch.object(ingest, "describe_picture", return_value="description") as describe:
             ingest.describe_pictures(jobs, "paper")
         self.assertEqual(describe.call_count, 2)
+
+    def test_picture_scheduling_is_bounded_ordered_and_stops_after_error(self):
+        """模拟乱序完成与系统异常，核对三任务上限、原始顺序及停止补发。"""
+        jobs = [(None, [f"{number}.png"], "caption", "context") for number in range(7)]
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                pool, submitted = Mock(), []
+
+                def submit(function, images, caption, context):
+                    """生成已完成的模拟任务，不启动线程或调用 API。"""
+                    future = Mock()
+                    future.result.return_value = images[0]
+                    if failed:
+                        future.result.side_effect = RuntimeError("API unavailable")
+                    return future
+
+                def completed(pending, **kwargs):
+                    """记录调度批次并模拟倒序完成。"""
+                    self.assertLessEqual(len(pending), ingest.PICTURE_WORKERS)
+                    submitted.append(pool.submit.call_count)
+                    return list(reversed(pending)), set()
+
+                pool.submit.side_effect = submit
+                with patch.object(ingest, "inspect_picture", return_value=(None, False)), \
+                     patch.object(ingest, "read_description_cache", return_value=None), \
+                     patch.object(ingest, "ThreadPoolExecutor", return_value=pool) as factory, \
+                     patch.object(ingest, "wait", side_effect=completed):
+                    if failed:
+                        with self.assertRaisesRegex(RuntimeError, "API unavailable"):
+                            ingest.describe_pictures(jobs, "paper")
+                    else:
+                        self.assertEqual(ingest.describe_pictures(jobs, "paper"), [job[1][0] for job in jobs])
+                self.assertEqual(submitted, [3] if failed else [3, 6, 7])
+                factory.assert_called_once_with(max_workers=ingest.PICTURE_WORKERS)
+                pool.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
 
     def test_decorative_is_skipped_and_uncaptioned_technical_picture_survives(self):
         """明确装饰标记不入库；无图题的有效图片仍保留原图与来源 ID。"""

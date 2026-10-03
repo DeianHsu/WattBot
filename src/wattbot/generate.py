@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path

@@ -25,6 +25,8 @@ RETRIEVAL_K = 60
 KEYWORD_K = 60
 FINAL_TOP_K = 10
 RERANK_K = RETRIEVAL_K + KEYWORD_K
+# 两家客户端共用连接参数；密钥、地址与客户端缓存仍各自独立。
+CHAT_OPTIONS = {"temperature": 0, "timeout": 120, "max_retries": 2}
 logger = logging.getLogger(__name__)
 # PDFium 不支持多线程同时调用；只串行本地渲染，不阻塞远程模型请求。
 PAGE_RENDER_LOCK = Lock()
@@ -44,10 +46,8 @@ def get_mimo():
         model="mimo-v2.6-flash",
         api_key=api_key,
         base_url="https://api.xiaomimimo.com/v1",
-        temperature=0,
         extra_body={"thinking": {"type": "disabled"}},
-        timeout=120,
-        max_retries=2,
+        **CHAT_OPTIONS,
     )
 
 
@@ -65,10 +65,8 @@ def get_deepseek():
         model="deepseek-flash",
         api_key=api_key,
         base_url="https://api.deepseek.com",
-        temperature=0,
         extra_body={"thinking": {"type": "disabled"}},
-        timeout=120,
-        max_retries=2,
+        **CHAT_OPTIONS,
     )
 
 
