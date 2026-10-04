@@ -28,7 +28,8 @@ PDF → Docling
 - `retrieve.py`：向量、关键词／短语召回与重排，合并证据并补充少量原始页面文字。
 - `generate.py`：事实规划、多模态回答、引用及拒答处理、CSV 输出。
 - `models.py`：共用模型和路径；`get_llm()` 根据配置选择 MiMo 或 DeepSeek。
-- `main.py`：建库、预测入口。
+- `scripts/build_index.py`：独立建库入口。
+- `scripts/predict.py`：独立预测入口。
 
 检索文本存入 Document 的 page_content，原始正文、完整表格、页码和图片路径直接存在 metadata 中，不再维护独立的 evidence.json。图片文件仍保存在 artifacts 下；长表格的不同检索块会重复存储完整表格内容，以换取更简单的取证逻辑。异常表格的模型转写只用于检索，metadata 明确标记文字解析不可靠。回答时按需渲染命中的完整表格原页，保留表头、标题和脚注，解析文字作为辅助；同页只附一次图片并列出所有适用来源标签，局部失败回退已有截图与文字。
 
@@ -38,7 +39,7 @@ PDF → Docling
 
 提示词只保留证据条件匹配、模型推理与计算、原始来源、拒答及输出格式；查询改写只用于检索，不作为最终回答的事实或提示。查询统一为事实字典，召回函数返回全部去重候选，Top-K 只在事实融合处选择；实体名称用于关键词召回，不人工改写重排顺序。读图来源由程序绑定；支持材料只检查来源标签是否已提供，不逐字匹配、不猜测引文归属，也不判断答案内容。
 
-上下文仍保留事实页锚点、少量稀有词页面、相关首页与跨页邻居；删除这些补充的小样对照出现回退，暂时保留。表格判定也保留轻量原图回退，但单行长文字不再仅因字数被视为损坏。源码简化与模型效果验证分开记录，详见 [收缩检查](reports/simplification_20261003.md)。
+上下文仍保留事实页锚点、少量稀有词页面、相关首页与跨页邻居。表格判定保留轻量原图回退，但单行长文字不再仅因字数被视为损坏。项目演进与文件职责见 [项目结构说明](docs/project_evolution_and_structure.md)。
 
 ## 使用
 
@@ -46,17 +47,18 @@ PDF → Docling
 
 ```powershell
 uv sync
+.venv\Scripts\Activate.ps1
 .venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-Windows 的 PyTorch 从官方 CUDA 13.0 索引安装。第二条命令应输出 `True`；embedding 和重排都必须能访问 CUDA，不会自动退回 CPU。模型和向量维度未变，已有 Chroma 索引不需要重建。
+Windows 的 PyTorch 从官方 CUDA 13.0 索引安装。最后一条命令应输出 `True`；embedding 和重排都必须能访问 CUDA，不会自动退回 CPU。模型和向量维度未变，已有 Chroma 索引不需要重建。
 
 在已有 `.env` 中配置模型，格式参考 `.env.example`。保留其他配置，不提交真实密钥。
 
 ```dotenv
 # 可选 mimo 或 deepseek；只需填写所选供应商的密钥。
 LLM_PROVIDER=mimo
-# 最终回答可选 off / high；本轮 high 仅验证 DeepSeek，默认 off。
+# 最终回答可选 off / high；high 目前仅在 DeepSeek 上验证，默认 off。
 ANSWER_REASONING_EFFORT=off
 MIMO_API_KEY=
 DEEPSEEK_API_KEY=
@@ -64,36 +66,35 @@ DEEPSEEK_API_KEY=
 
 `mimo` 使用 `mimo-v2.6-flash`；`deepseek` 使用支持图片的 `deepseek-flash`。未设置 `LLM_PROVIDER` 时沿用 MiMo。图片描述、异常表格转写、事实规划、读图与回答统一通过 `get_llm()` 调用；embedding 和重排仍使用本地 BGE 模型。仅切换问答模型时重新启动命令即可，不需要重建索引。
 
-2026-10-03 已在清空旧索引后完成全部 122 篇论文重建，生成 10,689 个检索块；脚注及续表解析改动已应用于全量论文。本轮等价精简不改变分块、检索表示、模型或 metadata 格式，无需重建索引。以后修改解析或描述策略时，仍需更新受影响论文；`build-index --pdf` 会替换该论文的索引，并按需调用图表 API。
+入口拆分不改变分块、检索表示、模型或 metadata 格式，已有索引无需重建。以后修改解析或描述策略时，需更新受影响论文；`build_index.py --pdf` 会替换该论文的索引，并按需调用图表 API。
 
 ```powershell
 # 建立全部论文的索引
-uv run python src/wattbot/main.py build-index
+python scripts/build_index.py
 
 # 只处理一篇论文
-uv run python src/wattbot/main.py build-index --pdf "papers/实际论文文件名.pdf"
+python scripts/build_index.py --pdf "papers/实际论文文件名.pdf"
 
 # 生成提交文件
-uv run python src/wattbot/main.py predict
+python scripts/predict.py
 
 # 模型或提示词改动后，重新预测全部题目（不重建索引）
-uv run python src/wattbot/main.py predict --restart
+python scripts/predict.py --restart
 
 # 切换到 DeepSeek 后使用独立输出，保留 MiMo 结果和各自的断点进度
-uv run python src/wattbot/main.py predict --output submissions/test_submission_deepseek.csv
+python scripts/predict.py --output submissions/test_submission_deepseek.csv
 ```
 
-需要比较改动前后的训练题效果时，先生成固定的 40 题开发集，再分别保存预测和评分：
+需要小范围比较改动时，自行准备问题 CSV（包含 `id`、`question`、`answer_unit`），分别保存预测和评分：
 
 ```powershell
-uv run python scripts/make_dev_questions.py
-uv run python src/wattbot/main.py predict --input artifacts/dev_questions.csv --output artifacts/dev_baseline.csv
+python scripts/predict.py --input artifacts/dev_questions.csv --output artifacts/dev_baseline.csv
 uv run python -m wattbot.evaluate input/train_QA.csv artifacts/dev_baseline.csv
 ```
 
-开发集只把题目和单位传给模型；标准答案仅用于评分。40 题刻意覆盖少见题型，分数不能直接等同于 Kaggle 公开榜分数。每次改动使用相同输入、不同输出文件对照。
+问题和单位用于推理，标准答案仅用于本地评分。每次对照使用相同输入、不同输出文件；小样分数不能直接等同于 Kaggle 公开榜分数。
 
-也可用 predict 的 --input 和 --output 指定问题文件和输出路径。安装项目后，uv run wattbot 可以调用同一入口。
+建库和预测只使用这两个独立脚本。激活项目环境后，也可进入 `scripts/` 目录，直接执行 `python build_index.py` 或 `python predict.py`；默认论文、索引和输入输出路径仍指向项目根目录。
 
 ## 约定与注意事项
 
@@ -105,7 +106,7 @@ uv run python -m wattbot.evaluate input/train_QA.csv artifacts/dev_baseline.csv
 - `--restart` 只用于新一轮的首次启动；该轮中断后续跑时去掉此参数，避免清空已保存的进度。
 - 新版图片描述使用 `.figure-retrieval-v3.txt`，异常表格检索转写使用 `.table-retrieval-v3.txt`。旧 `.txt` 保留且不复用，首次新版建库会重新生成所需描述；修改论文、描述提示词或描述模型后，需要清理对应新版缓存再建库。
 - 首次建库可能下载模型。Docling 正文与表格结构识别在本地运行；图片描述、异常表格的截图转写、问题事实规划及问答会调用所选大模型。正常表格不调用转写 API。
-- MiMo 默认关闭深度思考，模型仍为 `mimo-v2.6-flash`。8 题固定证据对照未出现答案或引用分回退；最低值题仍存在证据覆盖／读图波动，详见 [思考开关对照](reports/thinking_ab_20261002.md)。已有索引和图片描述缓存不需要重建。
+- 默认关闭深度思考；`ANSWER_REASONING_EFFORT=high` 只影响最终回答，目前仅在 DeepSeek 上验证，不影响索引和图片描述缓存。
 - 模型对象保留缓存，避免每道题重新加载 embedding 或 reranker。
 - 使用 wattbot_multimodal_v2 collection，旧的纯文本 wattbot collection 不变。按论文替换索引时，写入失败可能留下该论文的部分记录，需要重新建这篇论文。
 - 当前仍沿用原有 metadata 字段和 collection，不使用旧 evidence.json。分块、图表描述或解析策略改变后，应更新相应论文的索引；更新前预测仍读取旧表示。
@@ -152,7 +153,3 @@ uv run python -m wattbot.evaluate input/train_QA.csv artifacts/dev_baseline.csv
 离线回归检查：`uv run python -m unittest discover -s tests -v`。测试替换模型、解析器和索引，不调用 API、不下载模型、不改动现有索引；不代表全量论文或答案质量验证。
 
 代码精简集中在重复逻辑：统一索引 metadata 解码、复用续表 DataFrame、合并图片调度，以及共用客户端构造和全文查询。第二轮另合并召回去重状态、简化图片计数及提交字段组装；保留各供应商的独立缓存和原有接口。图片描述缓存、并发上限、局部回退、GPU 锁、断点恢复、Prompt、原图附件预算和输出契约均保留，无需重建索引。验证使用离线模拟，不代表答案准确率或 Kaggle 提分。
-
-本轮通用改动与小样边界见 [2026-10-03 质量优化记录](reports/quality_steps_20261003.md)；后续来源检查、表格原页与思考对照见 [小样验证记录](reports/source_table_reasoning_20261003.md)。
-
-输出契约的三步修改、六题对照及未解决的标注差异见 [输出契约修复记录](reports/output_contract_fix_20261003.md)。默认关闭思考，修改输出层无需重建索引；本轮小样没有新增答案值通过，不能据此宣称 Kaggle 提分。

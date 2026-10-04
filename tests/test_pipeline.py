@@ -1513,20 +1513,6 @@ class PredictionResumeTests(unittest.TestCase):
         self.assertEqual(self.output.read_text(encoding="utf-8"), "previous complete submission")
         self.assertEqual(len(generate.read_progress(self.progress, self.questions())), 3)
 
-    def test_cli_reports_incomplete_prediction_and_forwards_restart(self):
-        """存在未完成题目时入口退出为 1，不输出提交已保存的成功提示。"""
-        main = importlib.import_module("wattbot.main")
-        with patch.object(sys, "argv", ["wattbot", "predict", "--restart"]), \
-             patch.object(generate, "predict_all", return_value=None) as predict, \
-             patch("sys.stderr", new_callable=StringIO) as error, \
-             patch("sys.stdout", new_callable=StringIO) as output:
-            with self.assertRaises(SystemExit) as exit_info:
-                main.main()
-        self.assertEqual(exit_info.exception.code, 1)
-        predict.assert_called_once_with(None, None, restart=True)
-        self.assertIn("已保存成功结果", error.getvalue())
-        self.assertNotIn("提交文件已保存", output.getvalue())
-
 
 # 标准库 unittest 足够完成本次离线回归，不引入额外测试依赖。
 if __name__ == "__main__":
