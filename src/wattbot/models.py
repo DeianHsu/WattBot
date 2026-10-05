@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PAPERS_DIR = ROOT / "papers"
 ARTIFACTS_DIR = ROOT / "artifacts"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+RERANKER_MODEL = "BAAI/bge-reranker-base"
 RETRIEVAL_K = 60
 KEYWORD_K = 60
 FINAL_TOP_K = 10
@@ -98,7 +99,7 @@ def get_reranker():
 
     # 保留全部召回候选的重排结果，最终名额在 evidence_id 去重后截取。
     model = HuggingFaceCrossEncoder(
-        model_name="BAAI/bge-reranker-base",
+        model_name=RERANKER_MODEL,
         model_kwargs={"device": "cuda"},
     )
     return CrossEncoderReranker(model=model, top_n=RERANK_K)

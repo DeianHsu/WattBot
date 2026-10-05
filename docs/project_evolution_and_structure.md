@@ -1,6 +1,6 @@
 # WattBot 项目演进与文件功能结构
 
-记录日期：2026-10-04。核心代码基准：`82f487c`，即第二轮精简后的版本；本文同步记录后续入口拆分与旧报告清理。
+记录日期：2026-10-05。核心代码基准：`82f487c`，即第二轮精简后的版本；本文同步记录后续入口拆分、旧报告清理与重排模型试验及恢复。
 
 本文对照原始 `rag_demo/sample.py` 与当前源码，记录保留的设计、新增能力及文件职责。原始 demo 位于另一个项目目录，不属于当前仓库。本文描述代码实现，不把离线测试结果等同于答案准确率或比赛提分。
 
@@ -25,7 +25,7 @@
 | Embedding | `HuggingFaceEmbeddings`，`bge-small-zh-v1.5`，CPU，向量归一化 | 同一封装，`bge-small-en-v1.5`，GPU，向量归一化 | 保留 BGE 与封装，适配英文语料并加速 |
 | 索引 | Chroma，本地持久化，`add_documents` | Chroma，本地持久化，按论文替换记录并分批写入 | 保留向量数据库及 `Document + metadata` 组织方式 |
 | 召回 | 整题相似度检索，取 20 个块 | 事实级查询；向量召回与关键词召回；排名融合 | 保留向量检索，增加精确名称匹配和多事实覆盖 |
-| 重排 | `HuggingFaceCrossEncoder`、`CrossEncoderReranker`，`bge-reranker-base`，CPU，取 5 个块 | 同样的模型与封装，GPU；先重排候选，再按证据去重和融合 | 保留重排核心，调整运行设备和最终证据选择方式 |
+| 重排 | `HuggingFaceCrossEncoder`、`CrossEncoderReranker`，`bge-reranker-base`，CPU，取 5 个块 | 同样的封装和 BGE base 模型，GPU FP32；先重排候选，再按证据去重和融合 | 调整运行设备和最终证据选择方式；Qwen 试验后因耗时收益不匹配恢复原模型 |
 | 生成 | `ChatPromptTemplate + ChatOpenAI`，拼接文本上下文并返回自然语言 | `SystemMessage/HumanMessage + ChatOpenAI`，正文、表格、原图与结构化输出 | 保留上下文问答，替换消息组装并扩展输入、输出 |
 | 回答原则 | 使用上下文、不编造、说明不知道、注明来源 | 使用原始证据，必要事实缺失时拒答，检查来源并输出比赛字段 | 保留基本原则，落实为明确输出契约 |
 

@@ -51,7 +51,15 @@ uv sync
 .venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-Windows 的 PyTorch 从官方 CUDA 13.0 索引安装。最后一条命令应输出 `True`；embedding 和重排都必须能访问 CUDA，不会自动退回 CPU。模型和向量维度未变，已有 Chroma 索引不需要重建。
+Windows 的 PyTorch 从官方 CUDA 13.0 索引安装。最后一条命令应输出 `True`；embedding 和重排都必须能访问 CUDA，不会自动退回 CPU。embedding 仍为 `BAAI/bge-small-en-v1.5`，向量维度未变，已有 Chroma 索引不需要重建。
+
+重排使用原来的 `BAAI/bge-reranker-base`，CUDA FP32。2026-10-05 曾试验 Qwen3-Reranker-0.6B FP16：固定 48 题对照中，本地官方评分器总分从 BGE base 的 0.8867 提升至 0.8992，引用 F1 从 0.9021 降至 0.8868，单查询重排耗时约为原来的 2.7 倍。另以当前事实规划流程复核 12 题，答案值正确数为 base 10/12、Qwen 11/12。用户判断收益与耗时不匹配，已恢复 BGE base。48 题中有 36 题只用原问题查询，12 题复核也包含针对性选题；这些结果不能直接推算全量或线上成绩。
+
+随后固定 Qwen 重排、现有分块和索引文本，以 48 题共用的当前事实规划比较 embedding：BGE small 总分 0.9005、答案值正确 43/48；使用官方查询前缀的 BGE large 为 0.8814、42/48；Qwen3-Embedding-0.6B FP16 为 0.8808、42/48。Qwen embedding 的来源覆盖略好，却错答一题无答案题。当前保留 BGE small；独立候选索引和完整报告保存在本地 `artifacts/embedding_ab_20261005/`。这轮与前述 reranker 实验的查询不同，不能跨轮直接比较总分，也不能据此保证线上成绩。
+
+同日扩展到全部 245 道 train 题，复用上述 48 题，补齐其余 197 题的三组预测，共 735 份答案全部成功。small 总分 0.896408、答案值正确 217/245；large 为 0.896680、217/245；Qwen 为 0.883769、213/245。large 仅增加 0.000272，来自引用 F1，答案值为 9 题改善、9 题回退；2026 cohort 的总分则为 small 0.878344、large 0.874532、Qwen 0.869542。因此仍保留 small 和现有生产索引。完整预测、题型及 cohort 评分、逐题变化见本地 `artifacts/embedding_train_ab_20261005/`；这是 train 的单次比较，不能保证线上得分。
+
+上述 embedding 对照均使用试验时的 Qwen 重排，分数不作为恢复 BGE base 后的组合成绩；实验记录保留供复核。
 
 在已有 `.env` 中配置模型，格式参考 `.env.example`。保留其他配置，不提交真实密钥。
 
@@ -64,7 +72,7 @@ MIMO_API_KEY=
 DEEPSEEK_API_KEY=
 ```
 
-`mimo` 使用 `mimo-v2.6-flash`；`deepseek` 使用支持图片的 `deepseek-flash`。未设置 `LLM_PROVIDER` 时沿用 MiMo。图片描述、异常表格转写、事实规划、读图与回答统一通过 `get_llm()` 调用；embedding 和重排仍使用本地 BGE 模型。仅切换问答模型时重新启动命令即可，不需要重建索引。
+`mimo` 使用 `mimo-v2.6-flash`；`deepseek` 使用支持图片的 `deepseek-flash`。未设置 `LLM_PROVIDER` 时沿用 MiMo。图片描述、异常表格转写、事实规划、读图与回答统一通过 `get_llm()` 调用；embedding 和重排均使用本地 BGE。仅切换问答或重排模型时重新启动命令即可，不需要重建索引；使用已有预测进度时加 `--restart`。
 
 入口拆分不改变分块、检索表示、模型或 metadata 格式，已有索引无需重建。以后修改解析或描述策略时，需更新受影响论文；`build_index.py --pdf` 会替换该论文的索引，并按需调用图表 API。
 
