@@ -1,10 +1,26 @@
-# 忽略密钥、本地模型数据、论文以及可重新生成的解析产物。
-.env
-.venv/
-chroma_db/
-__pycache__/
-/papers/
-/.idea/
-/artifacts/
-# 提交 CSV、备份和断点进度只在本地保存，不上传公开仓库。
-/submissions/
+# Git 只发布项目主体；数据、测试、评分、分析、缓存及实验记录保留在本地。
+/*
+!/.env.example
+!/.gitattributes
+!/.gitignore
+!/README.md
+!/pyproject.toml
+!/uv.lock
+
+# 只发布建库和预测入口。
+!/scripts/
+/scripts/*
+!/scripts/build_index.py
+!/scripts/predict.py
+
+# 只发布运行管线；新增核心文件时同步更新此清单。
+!/src/
+/src/*
+!/src/wattbot/
+/src/wattbot/*
+!/src/wattbot/__init__.py
+!/src/wattbot/generate.py
+!/src/wattbot/index.py
+!/src/wattbot/ingest.py
+!/src/wattbot/models.py
+!/src/wattbot/retrieve.py
