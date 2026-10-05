@@ -2,7 +2,7 @@
 [project]
 name = "wattbot"
 version = "0.1.0"
-description = "基于 Docling、LangChain 和 MiMo 的 WattBot 多模态 RAG"
+description = "基于 Docling、LangChain 和 DeepSeek 的 WattBot 多模态 RAG"
 authors = [
     { name = "DeianHsu", email = "663781679@qq.com" }
 ]

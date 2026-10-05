@@ -64,10 +64,10 @@ def get_deepseek():
 
 
 def get_llm():
-    """统一选择生成模型；未指定供应商时沿用 MiMo。"""
+    """统一选择生成模型；未指定供应商时使用 DeepSeek。"""
     # 先读取配置，客户端缓存由各供应商函数负责。
     load_dotenv(ROOT / ".env")
-    provider = os.getenv("LLM_PROVIDER", "mimo").strip().lower()
+    provider = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
     if provider == "mimo":
         return get_mimo()
     if provider == "deepseek":

@@ -1,4 +1,4 @@
-# Git 只发布项目主体；数据、测试、评分、分析、缓存及实验记录保留在本地。
+# Git 发布项目主体与比赛官方 input；本地测试、分析、缓存及实验记录不跟踪。
 /*
 !/.env.example
 !/.gitattributes
@@ -6,6 +6,16 @@
 !/README.md
 !/pyproject.toml
 !/uv.lock
+
+# 比赛官方数据包；该目录中的自定义输入、预测结果和缓存仍不跟踪。
+!/input/
+/input/*
+!/input/metadata.csv
+!/input/test_Q.csv
+!/input/train_QA.csv
+!/input/Score.py
+!/input/CONTRIBUTE_QUESTIONS.md
+!/input/WRITEUP_TEMPLATE.md
 
 # 只发布建库和预测入口。
 !/scripts/
