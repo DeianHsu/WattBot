@@ -20,85 +20,233 @@ WattBot 2026 关注人工智能的能源消耗、用水、碳排放及其他环�
 
 ## 项目架构
 
-项目由论文建库和批量问答两条流程组成。正文、表格文本与图片描述使用同一个文本索引；检索命中后，再取回完整表格、原图及相关原文供大模型回答。
+项目由论文建库和批量问答两条流程组成，两者共享 Chroma 索引。
 
 ### 处理流程
+
+同一文件负责的连续步骤由外层分组框括起，文件名标在框上；节点只显示步骤标题和函数名。实线表示处理流程，虚线表示模型支持调用。核心文件位于 `src/wattbot/`，入口脚本位于 `scripts/`。
 
 ```mermaid
 flowchart TD
     subgraph Indexing["论文建库"]
-        PDF["论文 PDF"] --> Parse["Docling 解析"]
-        Parse --> Text["正文分块"]
-        Parse --> Table["表格结构与截图"]
-        Parse --> Figure["图题、图片描述与原图"]
-        Text --> Evidence["检索文本与原始证据"]
-        Table --> Evidence
-        Figure --> Evidence
-        Evidence --> Embedding["BGE embedding"]
-        Embedding --> Store["Chroma 本地索引"]
+        subgraph BuildEntry["`**scripts/build_index.py**`"]
+            Build["`**启动建库**
+
+main()`"]
+        end
+        subgraph IndexDispatch["`**index.py**`"]
+            Dispatch["`**读取论文与调度**
+
+build_index()`"]
+        end
+        subgraph IngestBuild["`**ingest.py**`"]
+            Parse["`**Docling 解析论文**
+
+ingest_pdf()
+get_converter()`"]
+            Text["`**正文分块**
+
+get_chunker()
+get_text_chunks()`"]
+            Table["`**表格处理与截图**
+
+table_groups()
+table_search_text()
+save_item_images()`"]
+            Figure["`**图片导出与描述**
+
+save_item_images()
+describe_pictures()`"]
+            Evidence["`**组装检索文本与证据**
+
+make_document()`"]
+            Parse --> Text
+            Parse --> Table
+            Parse --> Figure
+            Text --> Evidence
+            Table --> Evidence
+            Figure --> Evidence
+        end
+        subgraph IndexWrite["`**index.py**`"]
+            Write["`**向量化并写入索引**
+
+build_index()
+Chroma.add_documents()`"]
+            Store[("`**Chroma 本地索引**
+
+get_vector_store()`")]
+            Write --> Store
+        end
+        subgraph EmbeddingSupport["`**models.py**`"]
+            Embeddings["`**获取向量模型**
+
+get_embeddings()`"]
+        end
+        Build --> IndexDispatch
+        Dispatch --> IngestBuild
+        Evidence --> IndexWrite
+        Embeddings -.-> IndexWrite
     end
     subgraph Answering["批量问答"]
-        Question["问题与预期单位"] --> Plan["必需事实规划"]
-        Plan --> Recall["向量与关键词召回"]
-        Recall --> Rerank["BGE 重排"]
-        Rerank --> Merge["事实级融合与原文补充"]
-        Merge --> LLM["DeepSeek 多模态回答"]
-        LLM --> CSV["答案、引用、支持材料与解释 → CSV"]
+        subgraph PredictEntry["`**scripts/predict.py**`"]
+            PredictStart["`**启动预测**
+
+main()`"]
+        end
+        subgraph GenerateStart["`**generate.py**`"]
+            Predict["`**读取输入与已保存进度**
+
+predict_all()
+read_progress()`"]
+            Single["`**单题处理**
+
+answer_with_retry()
+answer_one()`"]
+            Plan["`**必需事实规划**
+
+plan_queries()`"]
+            Predict --> Single
+            Single --> Plan
+        end
+        subgraph RetrieveQuestions["`**retrieve.py**`"]
+            Recall["`**向量与关键词召回**
+
+retrieve()
+keyword_search()`"]
+            Rerank["`**候选去重与重排**
+
+retrieve()`"]
+            Merge["`**事实融合与原文补充**
+
+retrieve_facts()
+expand_pages()`"]
+            Recall --> Rerank
+            Rerank --> Merge
+        end
+        subgraph RerankerSupport["`**models.py**`"]
+            Reranker["`**获取重排模型**
+
+get_reranker()`"]
+        end
+        subgraph GenerateFinish["`**generate.py**`"]
+            Answer["`**多模态回答**
+
+generate_answer()
+invoke_json()
+table_page_images()
+read_chart()（按需）`"]
+            Format["`**整理答案值与引用**
+
+answer_one()
+normalize_answer_value()`"]
+            Save["`**保存进度与提交文件**
+
+predict_all()`"]
+            Answer --> Format
+            Format --> Save
+        end
+        PredictStart --> GenerateStart
+        Plan --> RetrieveQuestions
+        Reranker -.-> RetrieveQuestions
+        Merge --> GenerateFinish
     end
-    Store --> Recall
+    Store --> RetrieveQuestions
+
+    style BuildEntry fill:#f8fafc,stroke:#94a3b8
+    style IndexDispatch fill:#f8fafc,stroke:#94a3b8
+    style IngestBuild fill:#f8fafc,stroke:#94a3b8
+    style IndexWrite fill:#f8fafc,stroke:#94a3b8
+    style EmbeddingSupport fill:#eef2ff,stroke:#818cf8
+    style PredictEntry fill:#f8fafc,stroke:#94a3b8
+    style GenerateStart fill:#f8fafc,stroke:#94a3b8
+    style RetrieveQuestions fill:#f8fafc,stroke:#94a3b8
+    style RerankerSupport fill:#eef2ff,stroke:#818cf8
+    style GenerateFinish fill:#f8fafc,stroke:#94a3b8
 ```
 
-### 使用组件
+缺少事实时最多补查一轮；图表按需独立读取。预测使用已有索引，原文补充和页面渲染直接读取论文。
 
-| 环节 | 实现 |
-|---|---|
-| PDF 解析 | Docling，保留正文、表格结构和图片 |
-| 文本向量 | `BAAI/bge-small-en-v1.5` |
-| 索引与关键词检索 | Chroma 本地持久化索引及 FTS5 |
-| 重排 | `BAAI/bge-reranker-base` |
-| 图片描述、事实规划与回答 | 默认 DeepSeek `deepseek-flash`，可切换 MiMo `mimo-v2.6-flash` |
-| 提交生成 | 批量预测、进度恢复和 CSV 导出 |
+### 功能与实现
 
-### 文件职责与依赖
+以下按模型工具、论文处理、索引检索、回答生成和批量运行列出项目主要功能。
 
-核心代码位于 `src/wattbot/`，两个运行入口位于 `scripts/`：
+#### 模型与图片工具
 
-| 文件 | 职责 | 使用的项目模块 |
+实现文件：[models.py](src/wattbot/models.py)。
+
+| 功能 | 主要函数 | 当前实现 |
 |---|---|---|
-| [scripts/build_index.py](scripts/build_index.py) | 解析建库参数，调用 `build_index()` | `index` |
-| [scripts/predict.py](scripts/predict.py) | 解析预测参数，调用 `predict_all()` | `generate` |
-| [ingest.py](src/wattbot/ingest.py) | 解析 PDF、分块、导出图片和生成描述 | `models` |
-| [index.py](src/wattbot/index.py) | 创建、打开和更新 Chroma 索引 | `models`；建库时使用 `ingest` |
-| [retrieve.py](src/wattbot/retrieve.py) | 多路召回、重排、证据融合和原文补充 | `index`、`models` |
-| [generate.py](src/wattbot/generate.py) | 规划查询、组织问答、整理引用和输出 CSV | `retrieve`、`index`、`models` |
-| [models.py](src/wattbot/models.py) | 共用配置、模型客户端、模型加载和图片工具 | 不依赖其他项目业务模块 |
+| 文本向量 | `get_embeddings()` | `BAAI/bge-small-en-v1.5`，向量归一化，在图形处理器（GPU）上运行 |
+| 候选重排模型 | `get_reranker()` | `BAAI/bge-reranker-base`，在图形处理器（GPU）上运行 |
+| 大模型选择 | `get_llm()` | 默认深度求索（DeepSeek）`deepseek-flash`，可选 MiMo `mimo-v2.6-flash`；默认关闭思考 |
+| 原页与图片工具 | `page_image()`、`image_block()` | 按需渲染完整原页并缓存，将图片编码为多模态消息 |
 
-下图的箭头表示调用或使用关系：
+模型客户端、向量模型和重排模型按需加载，在同一进程中复用。
 
-```mermaid
-flowchart TD
-    BuildCLI["scripts/build_index.py"] -->|"build_index()"| IndexModule["index.py"]
-    PredictCLI["scripts/predict.py"] -->|"predict_all()"| GenerateModule["generate.py"]
+#### 论文解析与证据准备
 
-    IndexModule -->|"建库时调用 ingest_pdf()"| IngestModule["ingest.py"]
-    GenerateModule -->|"retrieve_facts() / expand_pages()"| RetrieveModule["retrieve.py"]
-    GenerateModule -->|"get_vector_store()"| IndexModule
-    RetrieveModule -->|"get_vector_store()"| IndexModule
+实现文件：[ingest.py](src/wattbot/ingest.py)。
 
-    IngestModule -->|"get_llm() / image_block()"| ModelsModule["models.py"]
-    IndexModule -->|"get_embeddings()"| ModelsModule
-    RetrieveModule -->|"get_reranker()"| ModelsModule
-    GenerateModule -->|"模型调用 / 原页渲染"| ModelsModule
-```
+| 功能 | 主要函数 | 当前实现 |
+|---|---|---|
+| 论文解析 | `get_converter()`、`ingest_pdf()` | Docling 提取正文、表格与图片；默认关闭光学字符识别（OCR） |
+| 正文分块 | `get_chunker()`、`get_text_chunks()` | 按章节和图表边界组织正文，合并同章节短块并控制长度 |
+| 表格与续表处理 | `table_groups()`、`table_search_text()` | 保留列名、单位与行信息，对满足条件的跨页续表归组 |
+| 原图导出 | `save_item_images()` | 导出表格与图片截图，保存来源页码和原图路径 |
+| 图表检索描述 | `describe_picture()`、`describe_pictures()` | 结合图题与相关正文描述图片；异常表格按截图转写，生成检索文字 |
+| 图像筛选与描述复用 | `inspect_picture()`、`describe_pictures()` | 空白图不调用描述模型，精确重复图复用描述，优先使用缓存，未缓存图片并发处理 |
+| 上下文与脚注 | `element_contexts()`、`element_notes()` | 为图表补充章节及相关原文；已识别脚注保留来源并独立入库 |
+| 证据记录封装 | `make_document()` | 将检索文本和原始证据组装成文档对象（Document），保存来源、页码与图片路径 |
 
-`models.py` 为业务模块提供共用模型和路径，模型对象在首次调用时加载并缓存。`__init__.py` 标识 Python 包，导入包本身不会启动建库或预测。`.gitignore` 和 `.gitattributes` 由 Git 用于文件跟踪和文本换行处理。
+#### 索引管理
 
-### 两条运行调用链
+实现文件：[index.py](src/wattbot/index.py)。
 
-- **建库**：`scripts/build_index.py` → `index.build_index()` → `ingest.ingest_pdf()`。`ingest` 返回 `Document` 列表，`index` 使用 embedding 将其写入 Chroma。每条记录的 `page_content` 用于检索，metadata 保存原始证据、来源、页码和图片路径。
-- **预测**：`scripts/predict.py` → `generate.predict_all()` → `answer_with_retry()` → `answer_one()`。每道题先规划查询，再调用 `retrieve_facts()` 和 `expand_pages()` 获取证据，随后由 `generate_answer()` 组织多模态回答，整理引用并输出 CSV；必要时补查一轮缺失事实。
+| 功能 | 主要函数 | 当前实现 |
+|---|---|---|
+| 本地持久化索引 | `get_vector_store()` | Chroma 统一索引正文、表格文本和图片描述，保存原始证据元数据 |
+| 按论文更新 | `build_index()` | 解析完成后替换该论文的旧记录，分批写入新记录 |
 
-`retrieve` 从索引 metadata 还原证据字典，`generate` 使用这些原文和图片生成答案。预测通过 `index.get_vector_store()` 打开已有索引；`index` 对 `ingest` 的调用只发生在建库时，预测中的原文补充和页面渲染直接读取 PDF。
+#### 混合检索
+
+实现文件：[retrieve.py](src/wattbot/retrieve.py)。
+
+| 功能 | 主要函数 | 当前实现 |
+|---|---|---|
+| 向量召回 | `retrieve()` | 根据查询语义检索，常规查询最多召回 60 条候选 |
+| 关键词与短语召回 | `keyword_search()` | 使用全文检索模块（FTS5）与 BM25 排序，常规查询最多召回 60 条候选 |
+| 名称与型号匹配 | `entity_pattern()` | 兼容名称中的空格和连字符，区分型号前缀与版本后缀 |
+| 候选重排与去重 | `retrieve()` | 合并两路候选，使用 BGE 重排，再按证据标识去重 |
+| 多事实证据融合 | `retrieve_facts()` | 使用倒数排名融合（RRF），兼顾各事实覆盖；首轮选取最多 10 份检索证据 |
+| 原文上下文补充 | `expand_pages()` | 补充相关页、论文首页与邻近正文，恢复实验条件等上下文 |
+
+#### 多模态回答与引用
+
+实现文件：[generate.py](src/wattbot/generate.py)。
+
+| 功能 | 主要函数 | 当前实现 |
+|---|---|---|
+| 事实规划与查询改写 | `plan_queries()` | 保留原问题，拆分必需事实，并生成检索改写 |
+| 结构化多模态回答 | `generate_answer()`、`invoke_json()` | 结合原文、表格原页与图片，使用 Pydantic 整理答案值、引用、支持材料和解释 |
+| 表格原页与独立读图 | `table_page_images()`、`read_chart()` | 表格优先附完整原页，必要时逐图读取数值及其条件 |
+| 缺失事实补查 | `answer_one()` | 根据答案草稿最多补查一轮，可在已命中文献内检索 |
+| 无答案处理 | `blank_answer()`、`answer_one()` | 无可用证据或明确拒答时，生成比赛要求的 `is_blank` 字段 |
+| 支持材料与引用来源 | `verify_supports()`、`answer_one()` | 将支持材料关联到证据标识，并从官方元数据生成引用链接 |
+| 答案值格式整理 | `normalize_answer_value()` | 整理真假值与显式数值范围，保留模型给出的数值精度 |
+
+#### 批量运行与评分
+
+主要实现文件：[generate.py](src/wattbot/generate.py)；官方评分文件：[input/Score.py](input/Score.py)。
+
+| 功能 | 主要函数 | 当前实现 |
+|---|---|---|
+| 并发问答 | `generate.predict_all()` | 最多并发处理 3 题，共享的本地检索与重排串行执行 |
+| 断点恢复与重新预测 | `generate.read_progress()` | 恢复问题和单位匹配的成功结果；使用 `--restart` 开始新一轮预测 |
+| 请求与输出异常重试 | `generate.answer_with_retry()`、`generate.invoke_json()` | 内容过滤和结构化输出截断按对应分支重试，相关失败题记录到 `.failed.csv` |
+| 进度保存与结果导出 | `generate.predict_all()` | 逐题写入进度，全部完成后按输入顺序更新提交文件，保留原输入列 |
+| 官方本地评分 | `Score.score()` | 使用比赛提供的答案值、引用 F1 与拒答评分规则；独立于预测流程 |
+
+模块间通过文档对象（Document）、证据字典和答案草稿传递数据：`page_content` 保存检索文本，`metadata` 保存原始证据、来源、页码和图片路径。
 
 ## 方案作用
 
