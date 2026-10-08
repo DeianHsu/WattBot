@@ -78,14 +78,15 @@ def get_llm():
 @lru_cache(maxsize=1)
 def get_embeddings():
     """加载文本向量模型，用于正文、表格文本、图片描述和问题。"""
-    # 建库和问题检索共用 GPU 向量模型；CUDA 不可用时立即报错，避免隐式退回 CPU。
-    if not torch.cuda.is_available():
-        raise RuntimeError("Embedding 需要 CUDA，但当前 PyTorch 无法使用 GPU；请运行 uv sync 并检查 torch.cuda.is_available()")
+    # 优先使用 CUDA；无可用 CUDA 时，建库和问题检索均使用 CPU。
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        logger.warning("CUDA 不可用，文本向量模型使用中央处理器（CPU）运行")
 
     # 归一化向量，并在当前进程中复用模型，避免每道题重复加载。
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": "cuda"},
+        model_kwargs={"device": device},
         encode_kwargs={"normalize_embeddings": True},
     )
 
@@ -93,14 +94,15 @@ def get_embeddings():
 @lru_cache(maxsize=1)
 def get_reranker():
     """加载文本重排模型；图片通过描述参与重排，而不是直接输入原图。"""
-    # 没有可用 CUDA 时立即停止，避免整批预测悄悄落回 CPU 跑数小时。
-    if not torch.cuda.is_available():
-        raise RuntimeError("重排需要 CUDA，但当前 PyTorch 无法使用 GPU；请运行 uv sync 并检查 torch.cuda.is_available()")
+    # 与向量模型采用相同设备策略，无可用 CUDA 时使用 CPU。
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        logger.warning("CUDA 不可用，重排模型使用中央处理器（CPU）运行")
 
     # 保留全部召回候选的重排结果，最终名额在 evidence_id 去重后截取。
     model = HuggingFaceCrossEncoder(
         model_name=RERANKER_MODEL,
-        model_kwargs={"device": "cuda"},
+        model_kwargs={"device": device},
     )
     return CrossEncoderReranker(model=model, top_n=RERANK_K)
 

@@ -174,8 +174,8 @@ predict_all()`"]
 
 | 功能 | 主要函数 | 当前实现 |
 |---|---|---|
-| 文本向量 | `get_embeddings()` | `BAAI/bge-small-en-v1.5`，向量归一化，在图形处理器（GPU）上运行 |
-| 候选重排模型 | `get_reranker()` | `BAAI/bge-reranker-base`，在图形处理器（GPU）上运行 |
+| 文本向量 | `get_embeddings()` | `BAAI/bge-small-en-v1.5`，向量归一化；优先使用图形处理器（GPU），CUDA 不可用时使用中央处理器（CPU） |
+| 候选重排模型 | `get_reranker()` | `BAAI/bge-reranker-base`；优先使用图形处理器（GPU），CUDA 不可用时使用中央处理器（CPU） |
 | 大模型选择 | `get_llm()` | 默认深度求索（DeepSeek）`deepseek-flash`，可选 MiMo `mimo-v2.6-flash`；默认关闭思考 |
 | 原页与图片工具 | `page_image()`、`image_block()` | 按需渲染完整原页并缓存，将图片编码为多模态消息 |
 
@@ -265,7 +265,7 @@ predict_all()`"]
 
 ### 1. 安装环境
 
-需要 Python 3.14 或以上版本、uv，以及可被 PyTorch 识别的 NVIDIA CUDA GPU。以下命令以 Windows PowerShell 为例：
+需要 Python 3.14 或以上版本和 uv。可用的 NVIDIA 图形处理器（GPU）用于 CUDA 加速；没有可用 CUDA 时自动使用中央处理器（CPU）。以下命令以 Windows PowerShell 为例：
 
 ```powershell
 git clone https://github.com/DeianHsu/WattBot.git
@@ -275,7 +275,7 @@ uv sync
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-最后一条命令应显示 CUDA 可用，即 `True`。Windows 环境按项目配置安装 CUDA 13.0 版 PyTorch；embedding 和重排在本地 GPU 上运行。
+最后一条命令显示 PyTorch 版本和 CUDA 可用状态：`True` 时本地向量模型与重排模型使用图形处理器（GPU），`False` 时自动使用中央处理器（CPU），运行速度会较慢。Windows 环境按项目配置安装 CUDA 13.0 版 PyTorch。
 
 `pyproject.toml` 声明项目和依赖范围，`uv.lock` 固定依赖版本；`uv sync` 读取二者并建立项目 `.venv` 环境。
 

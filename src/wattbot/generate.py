@@ -519,7 +519,7 @@ def generate_answer(question: str, answer_unit: str, evidence, *, visual_reading
 
 def answer_one(row, metadata_by_id):
     """完成一道题的检索、生成、引用整理和比赛字段归一化。"""
-    # 大模型调用可跨题并发；共享的本地索引和 GPU 重排模型一次只供一题检索。
+    # 大模型调用可跨题并发；共享的本地索引和重排模型一次只供一题检索。
     facts = plan_queries(row["question"])
     with RETRIEVAL_LOCK:
         evidence = retrieve_facts(facts)
