@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from wattbot.index import get_vector_store
 from wattbot.models import ROOT, get_llm, get_reranker, image_block
 from wattbot.retrieve import expand_pages, retrieve_facts
+from wattbot.checks import audit_numeric_answer, normalize_categorical_answer
 
 
 logger = logging.getLogger(__name__)
@@ -704,6 +705,19 @@ def answer_one(row, metadata_by_id):
     if set(draft["ref_ids"]) - set(ref_ids):
         logger.warning("%s 已移除未检索到或缺少元数据网址的引用", row["id"])
     answer_value = normalize_answer_value(draft["answer_value"], row["question"])
+    # 无单位类别题按题目词数限制/末尾从句收短；实体名和数值不受影响。
+    if row.get("answer_unit", "").strip().lower() in ("", "is_blank"):
+        shortened = normalize_categorical_answer(answer_value, row["question"])
+        if shortened:
+            logger.warning("%s 类别答案收短：%s -> %s", row["id"], answer_value, shortened)
+            answer_value = shortened
+    # 解释中明确可复核的最终算式/百分比与字段不一致时，采用可复核值。
+    audited = audit_numeric_answer(
+        row["question"], answer_value, draft["explanation"], row.get("answer_unit", "")
+    )
+    if audited and audited != answer_value:
+        logger.warning("%s 数值审计修正：%s -> %s", row["id"], answer_value, audited)
+        answer_value = audited
     is_blank = not answer_value or answer_value.lower() == "is_blank"
 
     # 只有核心答案缺失或明确拒答时才清空整题，不因辅助字段缺陷改写答案值。
