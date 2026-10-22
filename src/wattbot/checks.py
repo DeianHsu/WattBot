@@ -1,4 +1,7 @@
-"""确定性的答案值审计：只修正解释中能明确复核的算术/百分比错误。"""
+"""答案值的通用约束检查：数量审计、词数限制和类别格式。
+
+规则只依赖题目显式约束、答案类型和数值代数，不依赖题号、论文或特定短语。
+"""
 import re
 
 
@@ -8,7 +11,6 @@ UNIT = r"[A-Za-z%][A-Za-z%]*"
 MULTIPLIER_UNITS = {"time", "multiplier", "x", "fold"}
 WORD_LIMIT = re.compile(r"at most\s+(\d+|one|two|three|four|five)\s+words?", re.I)
 NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
-LOW_INFORMATION = {"energy", "full", "general", "general-purpose", "overall", "complete", "total"}
 
 
 def _number(text):
@@ -38,6 +40,59 @@ def _unit_matches(candidate, expected):
 
 def _same(a, b):
     return abs(a - b) <= max(abs(b) * 1e-3, 1e-3)
+
+
+def _word_limit(question):
+    match = WORD_LIMIT.search(question or "")
+    if not match:
+        return None
+    raw = match.group(1).lower()
+    return int(raw) if raw.isdigit() else NUMBER_WORDS.get(raw)
+
+
+def _is_acronym(prefix, candidate):
+    """括号内容是否是前面词的缩写；只对真正的缩写做删除。"""
+    initials = "".join(word[0] for word in prefix.split() if word and word[0].isalpha())
+    return len(candidate) >= 2 and candidate.isalpha() and initials.lower() == candidate.lower()
+
+
+def normalize_categorical_answer(value, question):
+    """只按题目显式词数限制删除末尾重复的缩写；不做短语表或语义截断。"""
+    text = (value or "").strip()
+    limit = _word_limit(question)
+    if not limit or not text or text.lower() == "is_blank":
+        return None
+    if len(text.split()) <= limit or re.fullmatch(NUMBER, text):
+        return None
+    match = re.search(r"^(.*?)\s*\(([A-Za-z0-9]{2,10})\)$", text)
+    if match and _is_acronym(match.group(1), match.group(2)):
+        candidate = match.group(1).strip()
+        if candidate and len(candidate.split()) <= limit:
+            return candidate
+    # 只超一个词时，删除紧邻中心词的普通形容词修饰语；不改实体、版本或首词。
+    words = text.split()
+    if len(words) == limit + 1 and words[-2].isalpha() and words[-2].islower():
+        candidate = " ".join([*words[:-2], words[-1]])
+        if len(candidate.split()) <= limit:
+            return candidate
+    return None
+
+
+def answer_constraint_violations(value, question, unit):
+    """返回题目显式约束被违反的通用原因，供格式重写或诊断使用。"""
+    text = (value or "").strip()
+    if not text or text.lower() == "is_blank":
+        return []
+    reasons = []
+    limit = _word_limit(question)
+    if limit and len(text.split()) > limit:
+        reasons.append(f"word_limit:{limit}")
+    if re.match(r"^\s*true\s+or\s+false\b", question or "", re.I) and text not in ("0", "1"):
+        reasons.append("boolean_format")
+    if re.search(r"\b(?:name both|which two|two (?:values|models|gpus|names|numbers))\b",
+                 question or "", re.I) and not text.startswith(("(", "[")):
+        reasons.append("two_values")
+    return reasons
 
 
 def _last_number(explanation):
@@ -87,37 +142,6 @@ def _compute(left, operator, right):
     if operator == "-":
         return left - right
     return None
-
-
-def normalize_categorical_answer(value, question):
-    """按题目的词数限制和末尾从句收短类别答案；只处理明确可删的修饰语。"""
-    text = (value or "").strip()
-    if not text or text.lower() == "is_blank" or re.fullmatch(NUMBER, text):
-        return None
-    original = text
-
-    # 末尾用途/范围从句不是核心术语：required for、of/that/which 引导的说明。
-    text = re.sub(r"\s+(?:required|used|needed)\s+for\b.*$", "", text, flags=re.I).strip()
-    clause = re.match(r"(.+?)\s+(?:of|that|which)\s+.+$", text, re.I)
-    if clause and len(clause.group(1).split()) >= 2:
-        text = clause.group(1).strip()
-
-    match = WORD_LIMIT.search(question or "")
-    if match:
-        raw = match.group(1).lower()
-        limit = int(raw) if raw.isdigit() else NUMBER_WORDS.get(raw)
-        if limit and len(text.split()) > limit:
-            # 末尾括号缩写通常只是重复说明；题目有词数限制时才删除。
-            text = re.sub(r"\s*\([A-Za-z0-9 .-]{2,10}\)\s*$", "", text).strip()
-            if len(text.split()) > limit:
-                words = [word for word in text.split()
-                         if word.lower().strip(",.") not in LOW_INFORMATION]
-                if len(words) <= limit:
-                    text = " ".join(words)
-                else:
-                    return None
-
-    return text if text and text != original else None
 
 
 def audit_numeric_answer(question, answer_value, explanation, unit):

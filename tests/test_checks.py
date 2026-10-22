@@ -4,7 +4,11 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from wattbot.checks import audit_numeric_answer, normalize_categorical_answer
+from wattbot.checks import (
+    answer_constraint_violations,
+    audit_numeric_answer,
+    normalize_categorical_answer,
+)
 
 
 class NumericAuditTests(unittest.TestCase):
@@ -85,24 +89,20 @@ class NumericAuditTests(unittest.TestCase):
         )
 
 
-class CategoricalShorteningTests(unittest.TestCase):
-    def test_trailing_clauses_are_removed(self):
-        self.assertEqual(
-            normalize_categorical_answer(
-                "reducing the scale of its initially proposed development",
-                "what is it considering doing to its initially proposed development?",
-            ),
-            "reducing the scale",
-        )
-        self.assertEqual(
-            normalize_categorical_answer(
-                "increased water consumption required for cooling",
-                "name one environmental cost",
-            ),
-            "increased water consumption",
-        )
+class CategoricalConstraintTests(unittest.TestCase):
+    def test_no_explicit_word_limit_means_no_semantic_shortening(self):
+        for value, question in (
+            ("reducing the scale of its initially proposed development",
+             "what is it considering doing to its initially proposed development?"),
+            ("increased water consumption required for cooling",
+             "name one environmental cost"),
+            ("full system power",
+             "At what scope must power be measured? Answer with a noun phrase of at most three words."),
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(normalize_categorical_answer(value, question))
 
-    def test_word_limit_removes_acronym_or_low_information_modifier(self):
+    def test_word_limit_removes_redundant_acronym_or_one_modifier(self):
         self.assertEqual(
             normalize_categorical_answer(
                 "Power Distribution Unit (PDU)",
@@ -117,6 +117,13 @@ class CategoricalShorteningTests(unittest.TestCase):
             ),
             "data center efficiency",
         )
+        # 非缩写括号和需要语义改写的超限答案不在这里处理。
+        self.assertIsNone(
+            normalize_categorical_answer(
+                "o4-mini (high)",
+                "Which variant? Answer with a noun phrase of at most two words.",
+            )
+        )
 
     def test_variant_and_entity_suffixes_are_preserved_without_word_limit(self):
         for value, question in (
@@ -129,6 +136,30 @@ class CategoricalShorteningTests(unittest.TestCase):
 
     def test_numeric_values_are_not_categorical_shortened(self):
         self.assertIsNone(normalize_categorical_answer("1234", "Answer with at most three words."))
+
+    def test_constraint_violations_are_reported_generically(self):
+        self.assertEqual(
+            answer_constraint_violations(
+                "data center energy efficiency",
+                "What does it measure? Answer with a noun phrase of at most three words.",
+                "is_blank",
+            ),
+            ["word_limit:3"],
+        )
+        self.assertEqual(
+            answer_constraint_violations("o4-mini (high)", "Which model variant?", "is_blank"),
+            [],
+        )
+        self.assertEqual(
+            answer_constraint_violations("True", "True or False: statement", "is_blank"),
+            ["boolean_format"],
+        )
+        self.assertEqual(
+            answer_constraint_violations(
+                "V100 and A30", "Name both GPUs.", "is_blank"
+            ),
+            ["two_values"],
+        )
 
 
 if __name__ == "__main__":

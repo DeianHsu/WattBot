@@ -18,7 +18,11 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from wattbot.index import get_vector_store
 from wattbot.models import ROOT, get_llm, get_reranker, image_block
 from wattbot.retrieve import expand_pages, retrieve_facts
-from wattbot.checks import audit_numeric_answer, normalize_categorical_answer
+from wattbot.checks import (
+    answer_constraint_violations,
+    audit_numeric_answer,
+    normalize_categorical_answer,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -73,6 +77,12 @@ class ChartReadings(BaseModel):
     """单张原图中的问题相关读数，来源 ID 由程序绑定。"""
 
     readings: list[NumericFact] = Field(default_factory=list)
+
+
+class FormattedAnswer(BaseModel):
+    """显式格式约束不满足时，只做抽取式缩短的结果。"""
+
+    answer_value: str = Field(description="A shorter answer using only words from the current answer.")
 
 
 class EvidenceQuery(BaseModel):
@@ -400,6 +410,40 @@ def blank_answer(reason):
     }
 
 
+def rewrite_answer_value(question, answer_value, unit, limit):
+    """只在题目显式词数超限时，要求模型从当前答案中抽取更短的完整术语。"""
+    prompt = (
+        "Shorten the current answer to satisfy the question's explicit word limit. "
+        "Use ONLY words from the current answer; preserve entities, model versions, "
+        "units and necessary qualifiers. If it still exceeds the limit, remove optional "
+        "modifiers (adjectives/descriptors) first; never remove the head noun. "
+        "Do not add facts, numbers, sources or explanations. "
+        "Return one JSON object matching the schema.\nJSON Schema:\n"
+        + json.dumps(FormattedAnswer.model_json_schema(), ensure_ascii=False)
+    )
+    content = (
+        f"Question: {question}\nCurrent answer: {answer_value}\n"
+        f"Expected unit: {unit or 'not specified'}\n"
+        f"Required: at most {limit} words."
+    )
+    try:
+        formatted = invoke_json(
+            FormattedAnswer,
+            [SystemMessage(content=prompt), HumanMessage(content=content)],
+        )
+    except (OutputParserException, ValidationError):
+        logger.warning("约束重写失败，保留原答案：%s", answer_value)
+        return None
+    candidate = formatted.answer_value.strip()
+    old_words = {word.lower().strip(".,;:") for word in answer_value.split()}
+    new_words = [word for word in candidate.split() if word.strip(".,;:")]
+    if (candidate and len(new_words) <= limit
+            and {word.lower().strip(".,;:") for word in new_words} <= old_words):
+        return candidate
+    logger.warning("约束重写未满足抽取或词数限制，保留原答案：%s -> %s", answer_value, candidate)
+    return None
+
+
 def normalize_answer_value(value, question=""):
     """整理真假值和明确的范围／多值格式，保留答案本身。"""
     # 严格数值范围可无损改成集合；型号连字符、负数和千位逗号保持原样。
@@ -711,6 +755,18 @@ def answer_one(row, metadata_by_id):
         if shortened:
             logger.warning("%s 类别答案收短：%s -> %s", row["id"], answer_value, shortened)
             answer_value = shortened
+    violations = answer_constraint_violations(
+        answer_value, row["question"], row.get("answer_unit", "")
+    )
+    word_limit = next((int(reason.split(":")[1]) for reason in violations
+                       if reason.startswith("word_limit:")), None)
+    if word_limit:
+        rewritten = rewrite_answer_value(
+            row["question"], answer_value, row.get("answer_unit", ""), word_limit
+        )
+        if rewritten:
+            logger.warning("%s 约束重写：%s -> %s", row["id"], answer_value, rewritten)
+            answer_value = rewritten
     # 解释中明确可复核的最终算式/百分比与字段不一致时，采用可复核值。
     audited = audit_numeric_answer(
         row["question"], answer_value, draft["explanation"], row.get("answer_unit", "")
