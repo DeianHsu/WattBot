@@ -2,11 +2,12 @@
 
 规则只依赖题目显式约束、答案类型和数值代数，不依赖题号、论文或特定短语。
 """
+import ast
+import math
 import re
 
 
 NUMBER = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+-]?\d+)?"
-SIMPLE_NUMBER = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 UNIT = r"[A-Za-z%][A-Za-z%]*"
 MULTIPLIER_UNITS = {"time", "multiplier", "x", "fold"}
 WORD_LIMIT = re.compile(r"at most\s+(\d+|one|two|three|four|five)\s+words?", re.I)
@@ -95,9 +96,54 @@ def answer_constraint_violations(value, question, unit):
     return reasons
 
 
-def _last_number(explanation):
-    matches = list(re.finditer(rf"({NUMBER})\s*(?:percent|%)?", explanation or "", re.I))
-    return _number(matches[-1].group(1)) if matches else None
+def calculate(expression):
+    """安全执行只含数字和算术函数的表达式，用于程序化数值题。"""
+    if not expression or len(expression) > 500:
+        return None
+    try:
+        tree = ast.parse(expression, mode="eval")
+        value = _eval_arithmetic(tree.body)
+    except (SyntaxError, ValueError, TypeError, ZeroDivisionError, OverflowError):
+        return None
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    if abs(value) > 1e18:
+        return None
+    return float(value)
+
+
+def _eval_arithmetic(node):
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _eval_arithmetic(node.operand)
+        return value if isinstance(node.op, ast.UAdd) else -value
+    if isinstance(node, ast.BinOp):
+        left, right = _eval_arithmetic(node.left), _eval_arithmetic(node.right)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.Mod):
+            return left % right
+        if isinstance(node.op, ast.Pow):
+            if abs(right) > 10 or abs(left) > 1e6:
+                raise ValueError("exponent too large")
+            return left ** right
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [_eval_arithmetic(item) for item in node.elts]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        functions = {"sum": sum, "min": min, "max": max, "abs": abs, "round": round}
+        function = functions.get(node.func.id)
+        if function is None or node.keywords:
+            raise ValueError("unsupported function")
+        args = [_eval_arithmetic(item) for item in node.args]
+        return function(*args)
+    raise ValueError("unsupported expression")
 
 
 def _explicit_answer(explanation):
@@ -112,40 +158,8 @@ def _explicit_answer(explanation):
     return _number(matches[-1].group(1)), matches[-1].group(2)
 
 
-def _last_equation(explanation):
-    """返回最后一个完整的“数 op 数 = 数 单位”算式。"""
-    pattern = re.compile(
-        rf"({SIMPLE_NUMBER})\s*({UNIT})?\s*(×|x|\*|/|÷|\+|-)\s*"
-        rf"({SIMPLE_NUMBER})\s*({UNIT})?\s*=\s*({SIMPLE_NUMBER})\s*({UNIT})?",
-        re.I,
-    )
-    found = None
-    text = explanation or ""
-    for match in pattern.finditer(text):
-        # 结果必须带单位，且算式不能是 10^7、a×b×c 等更长表达式的一段。
-        if not match.group(7):
-            continue
-        before = text[match.start() - 1:match.start()] if match.start() else ""
-        if before and (before in "^×*/+-(0123456789." or before.isdigit()):
-            continue
-        found = match
-    return found
-
-
-def _compute(left, operator, right):
-    if operator in ("×", "x", "*"):
-        return left * right
-    if operator in ("/", "÷"):
-        return right and left / right
-    if operator == "+":
-        return left + right
-    if operator == "-":
-        return left - right
-    return None
-
-
 def audit_numeric_answer(question, answer_value, explanation, unit):
-    """返回建议的数值字符串；没有明确可复核的修正时返回 None。"""
+    """只做高置信修正：显式 answer_value 或百分比→倍率；不改普通解释算式。"""
     if not answer_value or answer_value.lower() == "is_blank" or not _numeric_unit(unit):
         return None
     try:
@@ -169,20 +183,4 @@ def audit_numeric_answer(question, answer_value, explanation, unit):
         candidate, candidate_unit = explicit
         if _unit_matches(candidate_unit, unit) and not _same(candidate, current):
             return _format(candidate)
-
-    # 3) 简单算式：只有算式结果就是解释最后一个数字时才采用可复核值。
-    match = _last_equation(explanation)
-    if match:
-        result = _number(match.group(6))
-        last = _last_number(explanation)
-        if last is None or not _same(last, result):
-            return None
-        if not _unit_matches(match.group(7), unit):
-            return None
-        computed = _compute(_number(match.group(1)), match.group(3), _number(match.group(4)))
-        if computed is None:
-            return None
-        # 只修正明显错误，避免把三位有效数字的舍入改成中间精度。
-        if abs(computed - current) > max(abs(current) * 0.005, 1e-3):
-            return _format(computed)
     return None

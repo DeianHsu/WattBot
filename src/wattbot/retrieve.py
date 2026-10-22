@@ -147,13 +147,14 @@ def read_page(ref_id, page):
 def expand_pages(evidence, question=""):
     """补充三个相关页面及其论文首页，恢复原文条件和文档身份。"""
     # 不重新解析或建索引；原始证据仍在，补充标题、表格行和跨块条件。
-    expanded = {record["evidence_id"]: record for record in evidence}
+    expanded = {record.get("evidence_id") or f"record:{index}": record
+                for index, record in enumerate(evidence)}
     # 优先补回包含稀有题目术语的页面，避免通用硬件段落独占页面名额。
     tokens = lambda text: set(re.findall(r"[a-z0-9]{4,}", text.lower()))
     subjects = tokens(question) - {"what", "which", "that", "with", "from", "does", "reported", "according"}
-    frequencies = Counter(word for record in evidence for word in tokens(record["content"]))
+    frequencies = Counter(word for record in evidence for word in tokens(record.get("content", "")))
     priority = sorted(evidence, key=lambda record: sum(1 / frequencies[word]
-                      for word in subjects & tokens(record["content"])), reverse=True)
+                      for word in subjects & tokens(record.get("content", ""))), reverse=True)
     first = [(record["ref_id"], page) for record in evidence[:1] for page in record.get("pages", [])[:1]]
     pages = list(dict.fromkeys([*first, *((record["ref_id"], page)
                  for record in priority for page in record.get("pages", []))]))[:3]
@@ -173,4 +174,115 @@ def expand_pages(evidence, question=""):
         if text.strip():
             expanded[key] = {"evidence_id": key, "ref_id": ref_id, "modality": "text",
                              "pages": [page], "image_paths": [], "content": text}
+    return list(expanded.values())
+
+
+TABLE_REFERENCE = re.compile(r"\bTable\s+([A-Z]?\d+[A-Za-z]?)\b", re.I)
+
+
+@lru_cache(maxsize=512)
+def find_reference_page(ref_id, label):
+    """在指定论文中定位表格标题所在页，供表格题补充表格原文。"""
+    try:
+        reader = PdfReader(ROOT / "papers" / f"{ref_id}.pdf")
+    except (OSError, PdfReadError):
+        return None
+    pattern = re.compile(rf"\b{re.escape(label)}\b", re.I)
+    for number, page in enumerate(reader.pages, 1):
+        try:
+            text = page.extract_text() or ""
+        except (OSError, ValueError):
+            continue
+        if pattern.search(text):
+            return number, text
+    return None
+
+
+def expand_referenced_pages(evidence, question=""):
+    """跟随证据中的 Table X 引用补回表格页；不扩大论文集合。"""
+    labels = []
+    for record in evidence:
+        for match in TABLE_REFERENCE.finditer(record.get("content", "")):
+            labels.append((record["ref_id"], match.group(0)))
+    expanded = {record.get("evidence_id") or f"record:{index}": record
+                for index, record in enumerate(evidence)}
+    for ref_id, label in list(dict.fromkeys(labels))[:2]:
+        found = find_reference_page(ref_id, label)
+        if not found:
+            continue
+        page, text = found
+        if not text.strip():
+            continue
+        key = f"{ref_id}:table:{label}:{page}"
+        expanded[key] = {"evidence_id": key, "ref_id": ref_id, "modality": "text",
+                         "pages": [page], "image_paths": [], "content": text}
+    return list(expanded.values())
+
+
+@lru_cache(maxsize=256)
+def page_texts(ref_id):
+    """缓存同一论文的页文本，供表格页定位复用。"""
+    try:
+        reader = PdfReader(ROOT / "papers" / f"{ref_id}.pdf")
+    except (OSError, PdfReadError):
+        return ()
+    texts = []
+    for page in reader.pages:
+        try:
+            texts.append(page.extract_text() or "")
+        except (OSError, ValueError):
+            texts.append("")
+    return tuple(texts)
+
+
+@lru_cache(maxsize=512)
+def find_table_page(ref_id, tokens):
+    """按题目实体和数字密度定位附录表格页；返回页号和原文。"""
+    wanted = set(tokens)
+    for number, text in enumerate(page_texts(ref_id), 1):
+        lower = text.lower()
+        if sum(token in lower for token in wanted) < 2:
+            continue
+        numeric_lines = sum(
+            len(re.findall(r"\d+\.\d+", line)) >= 2 for line in text.splitlines()
+        )
+        if numeric_lines >= 8:
+            return number, text
+    return None
+
+
+def expand_table_pages(evidence, question):
+    """为数值表格题补一页同来源附录表格，保留原有检索结果。"""
+    if not any(TABLE_REFERENCE.search(record.get("content", "")) for record in evidence):
+        return evidence
+    table_refs = {record.get("ref_id") for record in evidence
+                  if TABLE_REFERENCE.search(record.get("content", ""))}
+    stopwords = {"what", "which", "that", "with", "from", "does", "were", "was",
+                 "the", "for", "and", "energy", "consumption", "inference", "dataset"}
+    tokens = tuple(sorted(
+        token for token in set(re.findall(r"[a-z0-9]{3,}", (question or "").lower()))
+        if token not in stopwords
+    ))
+    if len(tokens) < 2:
+        return evidence
+    expanded = {record.get("evidence_id") or f"record:{index}": record
+                for index, record in enumerate(evidence)}
+    seen_refs = set()
+    for record in evidence:
+        ref_id = record.get("ref_id")
+        if not ref_id or ref_id in seen_refs or ref_id not in table_refs:
+            continue
+        seen_refs.add(ref_id)
+        found = find_table_page(ref_id, tokens)
+        if not found:
+            continue
+        page, text = found
+        if not text.strip():
+            continue
+        key = f"{ref_id}:tablepage:{page}"
+        if key in expanded:
+            continue
+        expanded[key] = {"evidence_id": key, "ref_id": ref_id, "modality": "text",
+                         "pages": [page], "image_paths": [], "content": text}
+        break
     return list(expanded.values())

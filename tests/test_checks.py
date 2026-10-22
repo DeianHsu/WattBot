@@ -7,31 +7,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from wattbot.checks import (
     answer_constraint_violations,
     audit_numeric_answer,
+    calculate,
     normalize_categorical_answer,
 )
 
 
 class NumericAuditTests(unittest.TestCase):
-    def test_simple_multiplication_mismatch_is_corrected(self):
-        self.assertEqual(
+    def test_arbitrary_explanation_equation_does_not_override(self):
+        """普通解释中的比例式不能证明它是最终答案，避免语义误改。"""
+        self.assertIsNone(
             audit_numeric_answer(
                 "total tokens",
                 "1920000000",
                 "Per request = 128 + 512 = 640 tokens. Total = 640 × 3000 = 1,920,000,000 tokens.",
                 "tokens",
-            ),
-            "1920000",
+            )
         )
-
-    def test_embodied_carbon_multiplication_mismatch_is_corrected(self):
-        self.assertEqual(
+        self.assertIsNone(
             audit_numeric_answer(
                 "total embodied carbon",
                 "29632",
                 "Multiplying 463 kg/GPU by 8 GPUs gives 3704 kg; 463 × 8 = 3704 kg.",
                 "kg",
-            ),
-            "3704",
+            )
         )
 
     def test_explicit_answer_value_statement_wins(self):
@@ -87,6 +85,20 @@ class NumericAuditTests(unittest.TestCase):
                 "500 mL bottles",
             )
         )
+
+
+class CalculationTests(unittest.TestCase):
+    def test_numeric_program_is_executed(self):
+        self.assertAlmostEqual(
+            calculate("(606096 * 1000000 * 1e-4) / 1000"), 60609.6, places=6
+        )
+        self.assertEqual(calculate("sum([1, 2, 3])"), 6)
+        self.assertEqual(calculate("round(1.2345, 2)"), 1.23)
+
+    def test_unsafe_or_invalid_program_is_rejected(self):
+        for expression in ("__import__('os')", "x + 1", "2 ** 100", "1 / 0", ""):
+            with self.subTest(expression=expression):
+                self.assertIsNone(calculate(expression))
 
 
 class CategoricalConstraintTests(unittest.TestCase):

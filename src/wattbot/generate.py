@@ -17,10 +17,16 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from wattbot.index import get_vector_store
 from wattbot.models import ROOT, get_llm, get_reranker, image_block
-from wattbot.retrieve import expand_pages, retrieve_facts
+from wattbot.retrieve import (
+    expand_pages,
+    expand_referenced_pages,
+    expand_table_pages,
+    retrieve_facts,
+)
 from wattbot.checks import (
     answer_constraint_violations,
     audit_numeric_answer,
+    calculate,
     normalize_categorical_answer,
 )
 
@@ -105,6 +111,10 @@ class AnswerDraft(BaseModel):
     supports: list[EvidenceSupport] = Field(default_factory=list)
     missing_queries: list[EvidenceQuery] = Field(default_factory=list)
     answer: str = ""
+    calculation: str = Field(default="", description=(
+        "Optional Python arithmetic expression with numeric literals only; "
+        "no variables, units or prose. Use for a required multi-step calculation."
+    ))
     answer_value: str | int | float = Field(description=(
         "Only the requested value: a number without units, the minimal complete "
         "name/category, 1/0 for true/false, a required '(a, b)' string, or 'is_blank'. "
@@ -597,14 +607,13 @@ def generate_answer(question: str, answer_unit: str, evidence, facts=None, visua
     # 保留缺少单位时的既有规则，不把无单位的分类题误判为不可回答。
     answer_unit = answer_unit or ""
     read_sources = {reading["evidence_id"] for reading in visual_readings or []}
-    # 有单位且同论文命中多张图时直接隔离读取，省去一轮混合多图的初始答案。
+    # 有单位时，对所有明确的图表原图做独立读数；单图题也读取，避免只靠最终模型混合读图。
     if visual_readings is None and answer_unit.strip().lower() not in ("", "is_blank"):
-        counts = {}
-        for record in evidence:
-            if record["modality"] == "image" and record["image_paths"]:
-                counts[record["ref_id"]] = counts.get(record["ref_id"], 0) + 1
-        charts = [record for record in evidence if record["modality"] == "image"
-                  and record["image_paths"] and counts.get(record["ref_id"], 0) > 1]
+        charts = [record for record in evidence
+                  if record["modality"] == "image" and record["image_paths"]
+                  and not (re.match(r"\s*table\b", str(record.get("content") or ""), re.I)
+                           and not re.search(r"\b(?:fig(?:ure)?|chart|plot)\b",
+                                            str(record.get("content") or ""), re.I))][:2]
         if charts:
             with ThreadPoolExecutor(max_workers=3) as pool:
                 groups = list(pool.map(partial(read_chart, question, answer_unit,
@@ -630,8 +639,10 @@ def generate_answer(question: str, answer_unit: str, evidence, facts=None, visua
         content.append({"type": "text", "text": (
             "Independent per-image readings with program-bound source IDs follow. "
             "They were obtained from actual images; these already-read images "
-            "are not reattached. Use the readings as visual evidence. "
-            "Use them to check panel, scale and scope. Reconcile all matching "
+            "they already-read images are not reattached. Use the readings as visual evidence. "
+            "Use them to check panel, scale and scope. If the source text already states the "
+            "requested quantity exactly in the requested unit, prefer that text value; use an "
+            "approximate chart reading only when the text does not state it. Reconcile all matching "
             "readings against explicit original source wording. If incompatible "
             "matching totals cannot be reconciled, abstain and explain the conflict.\n"
             + json.dumps(visual_readings, ensure_ascii=False)
@@ -685,6 +696,10 @@ def generate_answer(question: str, answer_unit: str, evidence, facts=None, visua
         "in answer_value. For a calculation, use the question's exact baseline "
         "and ALL requested inputs; a single component is not a combined total. "
         "Match each input's own metric and scope, and cite every operand's source. "
+        "When the answer requires arithmetic, put a numeric-only Python expression "
+        "in calculation and the same final result in answer_value. "
+        "For table evidence, use its actual row labels, column headers and units; "
+        "do not collapse a table into a single prose sentence. "
         "Write the concise explanation before the final answer fields; copy its "
         "FINAL converted result into answer and answer_value. Keep quotes verbatim "
         "and include adjacent scope restrictions."
@@ -721,7 +736,9 @@ def answer_one(row, metadata_by_id):
     with RETRIEVAL_LOCK:
         evidence = retrieve_facts(facts)
     if evidence:
-        evidence = expand_pages(evidence, row["question"])
+        evidence = expand_referenced_pages(expand_pages(evidence, row["question"]), row["question"])
+        if row.get("answer_unit", "").strip().lower() not in ("", "is_blank"):
+            evidence = expand_table_pages(evidence, row["question"])
         draft = generate_answer(row["question"], row.get("answer_unit", ""), evidence, facts)
         # 只补查一轮缺失事实；论文限定必须来自本题实际证据，避免虚构来源。
         known_refs = {record["ref_id"] for record in evidence}
@@ -734,7 +751,13 @@ def answer_one(row, metadata_by_id):
                 extra.extend(retrieve_facts(queries, [lookup["ref_id"]] if lookup["ref_id"] else None))
         if extra:
             # 优先补查证据，并保留首轮已取得的操作数；不再次进入补查循环。
-            evidence = expand_pages(list({item["evidence_id"]: item for item in [*extra, *evidence]}.values()), row["question"])
+            evidence = expand_referenced_pages(
+                expand_pages(list({item["evidence_id"]: item for item in [*extra, *evidence]}.values()),
+                             row["question"]),
+                row["question"],
+            )
+            if row.get("answer_unit", "").strip().lower() not in ("", "is_blank"):
+                evidence = expand_table_pages(evidence, row["question"])
             draft = generate_answer(row["question"], row.get("answer_unit", ""), evidence, facts)
     else:
         logger.warning("%s 没有可用检索证据，回退为 is_blank", row["id"])
@@ -774,6 +797,27 @@ def answer_one(row, metadata_by_id):
     if audited and audited != answer_value:
         logger.warning("%s 数值审计修正：%s -> %s", row["id"], answer_value, audited)
         answer_value = audited
+    # 程序化计算：只接受数字字面量表达式，避免模型心算误差。
+    calculation = (draft.get("calculation") or "").strip()
+    directly_reported = bool(re.search(
+        rf"(?<![\d.,]){re.escape(answer_value)}(?![\d.,])", draft.get("explanation", "")
+    ))
+    if calculation and not directly_reported and row.get("answer_unit", "").strip().lower() not in ("", "is_blank"):
+        computed = calculate(calculation)
+        try:
+            current = float(answer_value)
+        except (TypeError, ValueError):
+            current = None
+        if computed is not None and current is not None:
+            if abs(computed - current) > max(abs(current) * 0.005, 1e-3):
+                candidate = (str(int(round(computed)))
+                             if abs(computed - round(computed)) < 1e-9
+                             else format(computed, ".15g"))
+                logger.warning("%s 程序化计算修正：%s -> %s (%s)",
+                               row["id"], answer_value, candidate, calculation)
+                answer_value = candidate
+        elif computed is not None and answer_value.lower() == "is_blank":
+            logger.warning("%s 程序化计算得到数值但模型拒答，保留拒答", row["id"])
     is_blank = not answer_value or answer_value.lower() == "is_blank"
 
     # 只有核心答案缺失或明确拒答时才清空整题，不因辅助字段缺陷改写答案值。

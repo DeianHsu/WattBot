@@ -441,7 +441,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(row["answer_value"], "1249")
         self.assertEqual(row["explanation"], "Model calculation.")
         self.assertNotIn("numeric_facts", draft)
-        self.assertNotIn("calculation", draft)
+        self.assertIn("calculation", draft)
 
     def test_calculation_preserves_model_precision(self):
         """倍率、估算时长和计数的精度全部由模型输出决定。"""
@@ -456,7 +456,7 @@ class PipelineTests(unittest.TestCase):
             explanation="700000000 * 0.42 / 1000 * 0.18 = 52920 liters.",
             calculation="v1 * v2 * v3").model_dump()
         self.assertEqual(draft["answer_value"], "52920")
-        self.assertNotIn("calculation", draft)
+        self.assertIn("calculation", draft)
 
     def test_numeric_condition_flag_does_not_override_final_answer(self):
         """旧的数值条件标记不触发程序拒答，最终核心答案保持原样。"""
@@ -504,15 +504,16 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(generate.normalize_answer_value(value, question), value)
 
     def test_retired_audit_fields_are_absent_from_schema(self):
-        """精简 schema 不要求数值抽取、可执行算式或额外正确性标记。"""
+        """精简 schema 只保留核心答案和可选的程序化计算字段。"""
         properties = generate.AnswerDraft.model_json_schema()["properties"]
         self.assertEqual(next(iter(properties)), "explanation")
-        for field in ("numeric_facts", "calculation", "visual_readings",
+        for field in ("numeric_facts", "visual_readings",
                       "unresolved_conflict", "selection_reason"):
             self.assertNotIn(field, properties)
         parser = PydanticOutputParser(pydantic_object=generate.AnswerDraft)
         draft = parser.parse('{"answer_value": 42, "numeric_facts": [{"value": 1}], "calculation": "v1 / 0"}')
         self.assertEqual(draft.answer_value, 42)
+        self.assertEqual(draft.calculation, "v1 / 0")
 
     def test_model_visual_abstention_is_preserved(self):
         """图表证据冲突时，模型明确给出的拒答及其原因继续保留。"""
