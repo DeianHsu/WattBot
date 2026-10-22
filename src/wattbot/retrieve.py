@@ -19,6 +19,11 @@ from wattbot.models import FINAL_TOP_K, KEYWORD_K, RETRIEVAL_K, ROOT, get_rerank
 logger = logging.getLogger(__name__)
 
 
+def _limit(ref_ids):
+    """已识别论文的补查保留两倍名额，避免正确设置段落在 10 名附近被截掉。"""
+    return FINAL_TOP_K * (2 if ref_ids else 1)
+
+
 def keyword_search(question, store, ref_ids=None):
     """利用 Chroma 已有的全文索引召回精确名称、型号和数值。"""
     # FTS5 的 trigram 只匹配至少三个字符的词；常见疑问词不参与排序。
@@ -88,31 +93,22 @@ def retrieve(question: str, ref_ids=None):
     ranked = get_reranker().compress_documents(documents=candidates, query=question)
 
     # 按重排顺序保留每份证据的最高排名块，去重后才计算最终 Top-K 名额。
-    limit = FINAL_TOP_K * (2 if ref_ids else 1)
+    limit = _limit(ref_ids)
     evidence = {}
     for doc in ranked:
         record = dict(doc.metadata)
+        if not record.get("evidence_id") or not record.get("ref_id") or record["evidence_id"] in evidence:
+            continue
         try:
-            if not all(isinstance(record.get(key), str) and record[key].strip()
-                       for key in ("evidence_id", "ref_id", "modality")):
-                raise ValueError("缺少证据标识或来源")
-            if record["evidence_id"] in evidence:
-                continue
             record["pages"] = json.loads(record.get("pages", "[]"))
             record["image_paths"] = json.loads(record.get("image_paths", "[]"))
-            if (not isinstance(record["pages"], list)
-                    or not isinstance(record["image_paths"], list)
-                    or not all(isinstance(path, str) for path in record["image_paths"])):
-                raise ValueError("页码或图片路径格式错误")
-            record["content"] = record.get("content", "")
-            if not isinstance(record["content"], str):
-                raise ValueError("原始证据内容不是文本")
-            if not record["content"].strip() and not record["image_paths"]:
-                raise ValueError("原始证据为空")
-        except (ValueError, TypeError) as exc:
-            logger.warning("跳过异常检索记录 %s：%s", record.get("evidence_id"), exc)
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("跳过无法解析页码或图片路径的检索记录：%s", record.get("evidence_id"))
             continue
-        evidence.setdefault(record["evidence_id"], record)
+        record["content"] = record.get("content", "")
+        if not record["content"].strip() and not record["image_paths"]:
+            continue
+        evidence[record["evidence_id"]] = record
         if len(evidence) == limit:
             break
     if len(evidence) < limit:
@@ -126,7 +122,7 @@ def retrieve_facts(queries, ref_ids=None):
     # search_facts 沿用已有字段名，记录查询编号；多条查询可对应同一事实。
     groups = [retrieve(query, ref_ids) if ref_ids else retrieve(query) for query in queries]
     # 已识别论文的补查保留两倍名额，避免正确设置段落在 10 名附近再次被截掉。
-    limit = FINAL_TOP_K * (2 if ref_ids else 1)
+    limit = _limit(ref_ids)
     evidence = {}
     for round_items in zip_longest(*groups):
         for fact_number, record in enumerate(round_items, start=1):

@@ -182,9 +182,9 @@ class IngestTests(unittest.TestCase):
             self.assertEqual(text, "A cooling-controller schematic.")
 
     def test_duplicates_with_different_context_are_not_shared(self):
-        """相同像素和图题、不同实验原文分别描述，避免缓存组串条件。"""
+        """不同实验原文分别描述，避免缓存串条件。"""
         jobs = [(None, ["a.png"], "same", "condition A"), (None, ["b.png"], "same", "condition B")]
-        with patch.object(ingest, "inspect_picture", return_value=((1, "same"), False)), patch.object(ingest, "read_description_cache", return_value=None), patch.object(ingest, "describe_picture", return_value="description") as describe:
+        with patch.object(ingest, "inspect_picture", return_value=False), patch.object(ingest, "read_description_cache", return_value=None), patch.object(ingest, "describe_picture", return_value="description") as describe:
             ingest.describe_pictures(jobs, "paper")
         self.assertEqual(describe.call_count, 2)
 

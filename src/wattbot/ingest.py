@@ -2,7 +2,6 @@
 
 import json
 import logging
-import hashlib
 import re
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from functools import lru_cache
@@ -80,13 +79,18 @@ def save_item_images(item, doc, output_dir):
     return paths
 
 
+def description_cache_path(image_paths, kind="figure"):
+    """返回图片描述缓存路径；没有图片时返回 None。"""
+    if not image_paths:
+        return None
+    return (ROOT / image_paths[0]).with_suffix(f".{kind}-retrieval-v3.txt")
+
+
 def read_description_cache(image_paths, kind="figure"):
     """读取已有描述；空缓存或坏缓存返回空值，留给生成流程处理。"""
     # 新检索表示使用独立缓存，旧 .txt 保留；重新建库不会误用旧提示的描述。
-    if not image_paths:
-        return None
-    cache_path = (ROOT / image_paths[0]).with_suffix(f".{kind}-retrieval-v3.txt")
-    if cache_path.exists():
+    cache_path = description_cache_path(image_paths, kind)
+    if cache_path is not None and cache_path.exists():
         try:
             cached = cache_path.read_text(encoding="utf-8").strip()
             if cached:
@@ -99,13 +103,12 @@ def read_description_cache(image_paths, kind="figure"):
 
 def describe_picture(image_paths, caption, context="", kind="figure"):
     """生成图表检索文字；描述和表格转写都不冒充最终原始证据。"""
-    # 按元素类型复用新版缓存，不读取或覆盖用户的旧描述文件。
+    cache_path = description_cache_path(image_paths, kind)
+    if cache_path is None:
+        return caption
     cached = read_description_cache(image_paths, kind)
     if cached:
         return cached
-    if not image_paths:
-        return caption
-    cache_path = (ROOT / image_paths[0]).with_suffix(f".{kind}-retrieval-v3.txt")
 
     # 原图、图题及同页正文一起描述；只有明确的装饰图才输出跳过标记。
     prompt = (
@@ -151,9 +154,8 @@ def describe_picture(image_paths, caption, context="", kind="figure"):
 
 
 def inspect_picture(image_paths):
-    """仅识别完全空白图和精确重复像素，不用尺寸或相似度猜测图片价值。"""
+    """只识别完全空白图；缺图或坏图返回 False，由描述流程降级。"""
     # 白图或全透明图没有独立视觉信息；黑色、彩色图例色块仍保留。
-    signatures = []
     all_blank = bool(image_paths)
     for path in image_paths:
         try:
@@ -161,75 +163,61 @@ def inspect_picture(image_paths):
                 rgba = image.convert("RGBA")
                 white = Image.new("RGBA", rgba.size, "white")
                 visible = Image.alpha_composite(white, rgba).convert("RGB")
-                all_blank = all_blank and all(low == high == 255 for low, high in visible.getextrema())
-                signatures.append((rgba.size, hashlib.sha256(rgba.tobytes()).hexdigest()))
+                all_blank = all_blank and all(
+                    low == high == 255 for low, high in visible.getextrema()
+                )
         except (FileNotFoundError, UnidentifiedImageError) as exc:
-            # 无法确认像素相同就不合并；缺图由原有描述流程降级。
             logger.warning("图片筛选检查失败，不自动过滤 %s：%s", path, exc)
-            return None, False
-    return tuple(signatures), all_blank
+            return False
+    return all_blank
 
 
 def describe_pictures(jobs, ref_id):
-    """图片去重、复用缓存并受控并发描述；按输入顺序返回结果。"""
+    """复用缓存并受控并发描述；按输入顺序返回结果。"""
     # 各图片只共享描述，不合并 evidence_id、来源页码或原始附件。
     started = perf_counter()
     descriptions = [""] * len(jobs)
-    groups = {}
-    filtered = 0
+    pending = []
+    filtered = cached_count = 0
     for number, (_, images, caption, context) in enumerate(jobs):
-        signature, blank = inspect_picture(images)
-        if not images or blank:
+        if not images or inspect_picture(images):
             descriptions[number] = caption
             filtered += 1
             print(f"[{ref_id}] 图片 {number + 1}：无可用图像或完全空白，仅保留图题", flush=True)
             continue
-        key = (signature, caption, context) if signature is not None else (number, caption, context)
-        groups.setdefault(key, []).append(number)
-
-    # 同组任意成员的有效缓存都可复用；未命中缓存的独立图片才进入线程池。
-    pending_jobs = []
-    cached_count = 0
-    duplicate_count = sum(len(numbers) - 1 for numbers in groups.values())
-    for numbers in groups.values():
-        cached = next((value for number in numbers
-                       if (value := read_description_cache(jobs[number][1]))), None)
+        cached = read_description_cache(images)
         if cached:
-            for number in numbers:
-                descriptions[number] = cached
-            cached_count += len(numbers)
+            descriptions[number] = cached
+            cached_count += 1
         else:
-            pending_jobs.append(numbers)
+            pending.append((number, images, caption, context))
+
     completed = filtered + cached_count
     print(f"[{ref_id}] 图片描述：{completed}/{len(jobs)}；空白/缺图 {filtered}，"
-          f"缓存覆盖 {cached_count}，精确重复 {duplicate_count}，"
-          f"待生成 {len(pending_jobs)} 组，并发 {PICTURE_WORKERS}", flush=True)
+          f"缓存覆盖 {cached_count}，待生成 {len(pending)}，并发 {PICTURE_WORKERS}", flush=True)
 
     # 最多提交三个在途任务；一旦系统异常，不再调度后续图片。
-    iterator = iter(pending_jobs)
+    iterator = iter(pending)
     pool = ThreadPoolExecutor(max_workers=PICTURE_WORKERS)
-    pending = {}
+    futures = {}
     try:
-        for _ in range(min(PICTURE_WORKERS, len(pending_jobs))):
-            numbers = next(iterator)
-            _, images, caption, context = jobs[numbers[0]]
-            pending[pool.submit(describe_picture, images, caption, context)] = numbers
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+        for _ in range(min(PICTURE_WORKERS, len(pending))):
+            number, images, caption, context = next(iterator)
+            futures[pool.submit(describe_picture, images, caption, context)] = number
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
             for future in done:
-                numbers = pending.pop(future)
-                description = future.result()
-                for number in numbers:
-                    descriptions[number] = description
-                completed += len(numbers)
+                number = futures.pop(future)
+                descriptions[number] = future.result()
+                completed += 1
                 print(f"[{ref_id}] 图片描述：{completed}/{len(jobs)}，"
-                      f"本组生成/回退完成，已用 {perf_counter() - started:.1f}s", flush=True)
+                      f"已用 {perf_counter() - started:.1f}s", flush=True)
             for _ in done:
-                numbers = next(iterator, None)
-                if numbers is None:
+                job = next(iterator, None)
+                if job is None:
                     break
-                _, images, caption, context = jobs[numbers[0]]
-                pending[pool.submit(describe_picture, images, caption, context)] = numbers
+                number, images, caption, context = job
+                futures[pool.submit(describe_picture, images, caption, context)] = number
     finally:
         # 已发送的请求无法撤销，等待在途任务结束；系统异常原样向上抛出。
         pool.shutdown(wait=True, cancel_futures=True)

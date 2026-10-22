@@ -414,90 +414,78 @@ def normalize_answer_value(value, question=""):
     return {"true": "1", "false": "0"}.get(text.lower(), text)
 
 
-def verify_supports(draft, evidence):
-    """核对引文归属并整理模型选定的必需证明，不判断答案内容。"""
-    def normalize(text):
-        """容忍 PDF 空格及 Unicode 字形差异，保留标点和数字。"""
-        # 只连接换行拆开的英文单词；数字、同行连字符和否定词均不删除。
-        text = re.sub(r"\b([A-Za-z]{2,})-\s*\n\s*([a-z]{2,})\b", r"\1\2", text)
-        text = text.translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'}))
-        return "".join(unicodedata.normalize("NFKC", text).split()).casefold()
+def _normalize_quote(text):
+    """统一大小写、空白和引号；保留同行连字符，只有内容侧可去换行连字符。"""
+    text = text.translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'}))
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
-    def match_quote(quote, content):
-        """允许明确省略的逐字片段，禁止模糊改写或删除不匹配的数字。"""
-        # 复合词的连字符恰好落在换行处时，按该原文恢复连接；同行连字符不放宽。
-        for word in re.findall(r"\b[A-Za-z]{2,}-[a-z]{2,}\b", quote):
-            left, right = word.split("-")
-            if re.search(rf"\b{re.escape(left)}-\s*\n\s*{re.escape(right)}\b", content, re.I):
-                quote = quote.replace(word, left + right)
-        # 末尾逗号／句号和 PDF 脚注间隔不会使整篇真实来源消失。
-        needle, original = normalize(quote).rstrip(".,;:"), normalize(content)
-        # 短单元格或数值引文也可绑定真实来源；边界防止把 25 匹配到 125 或 25.1。
-        number = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[+-]?\d+)?"
-        numeric = bool(re.fullmatch(number, needle))
-        prefix = r"[\d.,+-]" if numeric else r"\w"
-        suffix = r"\d|[.,]\d|[eE][+-]?\d" if numeric else r"\w"
-        short_pattern = r"\s*".join(re.escape(part) for part in
-                                    unicodedata.normalize("NFKC", quote.rstrip(".,;:")).split())
-        if needle and (len(needle) >= 20 and needle in original or re.search(
-                rf"(?<!{prefix}){short_pattern}(?!{suffix})",
-                unicodedata.normalize("NFKC", content), re.I)):
-            return quote.rstrip(".,;:")
-        # 长引文只错一个连接词时，恢复完整原文；数字、否定、实体和单位不能改。
-        if len(needle) >= 100:
-            linkers = {"is", "are", "of"}
-            parts = re.split(r"(\s+|\b(?:is|are|of)\b)", quote.rstrip(".,;:"), flags=re.I)
-            pattern = "".join(r"\s*" if part.isspace() else
-                              r"\b(?:is|are|of)\b" if part.lower() in linkers else re.escape(part)
-                              for part in parts)
-            # 引用输出采用匹配到的原始文本，避免把修正后的模型句子当原文。
-            candidate = re.search(pattern, content, re.I)
-            if candidate:
-                actual = candidate.group()
-                words = lambda text: re.findall(r"\w+|[^\w\s]", text.casefold())
-                left, right = words(quote.rstrip(".,;:")), words(actual)
-                if len(left) == len(right) and sum(a != b for a, b in zip(left, right)) == 1:
-                    return actual
-        parts = re.split(r"\s*(?:\.{3}|…|\n+|(?<=[.!?])\s+)\s*", quote)
-        matched, offset = [], 0
+
+def _contains(haystack, needle):
+    """文本逐字包含；纯数字使用边界，避免把 25 匹配到 125、25.1 或 25e3。"""
+    if not needle:
+        return False
+    if re.fullmatch(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[+-]?\d+)?", needle):
+        return re.search(
+            rf"(?<![\d.,+-]){re.escape(needle)}(?!\d|[.,]\d|[eE][+-]?\d)", haystack
+        ) is not None
+    return needle in haystack
+
+
+def _quote_matches(quote, content):
+    """逐字匹配完整引文；省略号/脚注分段按顺序匹配，不做模糊改写。"""
+    needle = _normalize_quote(quote).strip(".,;:")
+    haystack = _normalize_quote(content)
+    if _contains(haystack, needle):
+        return True
+
+    # PDF 只在换行处拆开复合词时才允许去连字符；同行连字符保持严格匹配。
+    if re.search(r"[A-Za-z]-\s*\n", content):
+        unwrapped_quote = _normalize_quote(re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", "", quote))
+        content_clean = re.sub(r"(?<=[A-Za-z])-\s*\n\s*(?=[a-z])", "", content)
+        content_clean = re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", "", content_clean)
+        if _contains(_normalize_quote(content_clean), unwrapped_quote.strip(".,;:")):
+            return True
+
+    # 脚注编号、省略号或换行把引文拆成多段时，各段必须按原顺序出现。
+    number = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[+-]?\d+)?"
+    parts = [part.strip(" .,;:") for part in re.split(
+        r"\s*(?:\.{3}|…|(?<=[.!?])\s+|\n+)\s*", quote
+    ) if len(_normalize_quote(part)) >= 3 or re.fullmatch(number, _normalize_quote(part))]
+    if len(parts) > 1:
+        offset = 0
         for part in parts:
-            segment = normalize(part).rstrip(".,;:")
-            position = original.find(segment, offset) if len(segment) >= 20 else -1
-            # 明确省略号中的短表格数值也逐字核对，保留符号、小数、科学计数及顺序。
-            if re.search(r"\.{3}|…", quote) and re.fullmatch(number, segment):
-                pattern = rf"(?<![\d.,+-]){re.escape(segment)}(?!\d|[.,]\d|[eE][+-]?\d)"
-                hit = re.compile(pattern).search(original, offset)
-                position = hit.start() if hit else -1
-            if position >= 0:
-                matched.append(part.rstrip(".,;:"))
-                offset = position + len(segment)
-        recovered = " … ".join(matched)
-        numbers = r"[+-]?\d+(?:\.\d+)?"
-        # 表头被模型整理过时仍保留完整的逐字数据行；每个引用数字必须可核验。
-        rows = sum(bool(re.match(r"^\d+(?:\s+\d+(?:\.\d+)?%?){3,}", part.strip())) for part in parts)
-        coverage = .5 if rows >= 2 else .7
-        if len(normalize(recovered)) >= max(20, len(needle) * coverage) and re.findall(numbers, recovered) == re.findall(numbers, quote):
-            return recovered
-        return ""
+            norm = _normalize_quote(part).strip(".,;:")
+            if re.fullmatch(number, norm):
+                hit = re.search(
+                    rf"(?<![\d.,+-]){re.escape(norm)}(?!\d|[.,]\d|[eE][+-]?\d)",
+                    haystack[offset:],
+                )
+                position = offset + hit.start() if hit else -1
+            else:
+                position = haystack.find(norm, offset)
+            if position < 0:
+                return False
+            offset = position + len(norm)
+        return True
+    return False
 
+
+def verify_supports(draft, evidence):
+    """核对支持材料是否逐字存在于给定来源，并整理引用；不改答案值。"""
     records = {record["evidence_id"]: record for record in evidence}
     verified = []
     for support in draft.get("supports", []):
         source = support["evidence_id"]
         record = records.get(source)
         quote = support["quote"].strip()
-        # 引文逐字匹配当前提供的原始正文/表格，唯一匹配时修正模型错挂的来源。
         if quote:
-            matches = {item["evidence_id"]: text for item in evidence
-                       if (text := match_quote(quote, item["content"]))}
-            if source not in matches:
-                # 同一论文的块与整页可能重复命中；论文归属唯一即可，不跨论文猜来源。
-                owners = {records[key]["ref_id"] for key in matches}
-                record = records[next(iter(matches))] if len(owners) == 1 else None
+            matched = [item for item in evidence if _quote_matches(quote, item["content"])]
+            if record is None or not _quote_matches(quote, record["content"]):
+                owners = {item["ref_id"] for item in matched}
+                record = matched[0] if len(owners) == 1 and matched else None
             if record is None:
-                logger.warning("支持引文无法唯一绑定原文，跳过该条，不改 answer_value")
+                logger.warning("支持引文无法绑定唯一来源，跳过该条，不改 answer_value")
                 continue
-            quote = matches[record["evidence_id"]]
         elif not (record and record.get("image_paths") and support["visual_detail"].strip()):
             logger.warning("支持材料缺少可核验的原文或图像，跳过该条")
             continue
@@ -507,13 +495,11 @@ def verify_supports(draft, evidence):
                          support.get("required", True)))
         support["evidence_id"] = record["evidence_id"]
 
-    # 未给核验记录时保持既有降级；明确给出但全被否定的材料不再当作有效引用。
     if not verified:
         if draft.get("supports"):
             draft["ref_ids"] = []
             draft["supporting_materials"] = "is_blank"
         return draft
-    # 沿用模型的主证据选择；全部被标为旁证时保守保留已核验来源。
     selected = [(record, text) for record, text, required in verified if required]
     if not selected:
         logger.warning("缺少必需证明标记，保留已核验来源")
