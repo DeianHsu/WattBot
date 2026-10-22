@@ -1,384 +1,136 @@
-# WattBot 2026：多模态 RAG 参赛方案
+# WattBot 多模态 RAG
 
-本项目面向 [Kaggle WattBot 2026](https://www.kaggle.com/competitions/WattBot2026/overview)，从指定论文与报告的正文、表格和图表中检索证据，生成包含答案值、引用、支持材料和解释的提交 CSV。
+使用 Docling 解析论文，BGE + Chroma 检索，BGE 重排，MiMo 或 DeepSeek 根据正文、表格和原图回答。
 
-## 比赛背景
-
-WattBot 2026 关注人工智能的能源消耗、用水、碳排放及其他环境影响。参赛系统需要回答直接事实、图表读数、数学推导、跨文献组合和冲突消解等问题；语料不足以支持答案时，应明确拒答。任务介绍见 [UW–Madison 官方项目页](https://uw-madison-datascience.github.io/ML-X-Nexus/Projects/ML-Marathon/WattBot-2026.html)。
-
-当前使用的数据包包含 122 份文献索引、245 道训练题和 317 道测试题。仓库 `input/` 中的文件由比赛提供，来源为 [WattBot 2026 官方数据页面](https://www.kaggle.com/competitions/WattBot2026/data)。文献由 `metadata.csv` 给出下载链接，参赛者需要准备对应 PDF。
-
-比赛采用 0～1 的 WattBot Score：
-
-| 评分项 | 权重 | 关注内容 |
-|---|---:|---|
-| `answer_value` | 75% | 数值、类别或不可回答状态是否正确 |
-| `ref_id` | 20% | 支持文献集合与标准引用集合的 F1 |
-| `is_NA` | 5% | 不可回答题是否正确拒答并清空证据字段 |
-
-数值答案通常按 ±0.1% 相对容差判断，部分题目有单独的容忍范围；具体规则以数据包中的官方 `Score.py` 为准。`answer_unit` 由问题文件提供，不单独计分。不可回答时，`answer_value`、`ref_id`、`ref_url` 和 `supporting_materials` 使用 `is_blank`。
-
-## 项目架构
-
-项目由论文建库和批量问答两条流程组成，两者共享 Chroma 索引。
-
-### 处理流程
-
-实线：处理流程；虚线：模型支持调用。
-
-```mermaid
-flowchart TD
-    subgraph Indexing["论文建库"]
-        subgraph BuildEntry["`**scripts/build_index.py**`"]
-            Build["`**启动建库**
-
-main()`"]
-        end
-        subgraph IndexDispatch["`**index.py**`"]
-            Dispatch["`**读取论文与调度**
-
-build_index()`"]
-        end
-        subgraph IngestBuild["`**ingest.py**`"]
-            Parse["`**Docling 解析论文**
-
-ingest_pdf()
-get_converter()`"]
-            Text["`**正文分块**
-
-get_chunker()
-get_text_chunks()`"]
-            Table["`**表格处理与截图**
-
-table_groups()
-table_search_text()
-save_item_images()`"]
-            Figure["`**图片导出与描述**
-
-save_item_images()
-describe_pictures()`"]
-            Evidence["`**组装检索文本与证据**
-
-make_document()`"]
-            Parse --> Text
-            Parse --> Table
-            Parse --> Figure
-            Text --> Evidence
-            Table --> Evidence
-            Figure --> Evidence
-        end
-        subgraph IndexWrite["`**index.py**`"]
-            Write["`**向量化并写入索引**
-
-build_index()
-Chroma.add_documents()`"]
-            Store[("`**Chroma 本地索引**
-
-get_vector_store()`")]
-            Write --> Store
-        end
-        subgraph EmbeddingSupport["`**models.py**`"]
-            Embeddings["`**获取向量模型**
-
-get_embeddings()`"]
-        end
-        Build --> IndexDispatch
-        Dispatch --> IngestBuild
-        Evidence --> IndexWrite
-        Embeddings -.-> IndexWrite
-    end
-    subgraph Answering["批量问答"]
-        subgraph PredictEntry["`**scripts/predict.py**`"]
-            PredictStart["`**启动预测**
-
-main()`"]
-        end
-        subgraph GenerateStart["`**generate.py**`"]
-            Predict["`**读取输入与已保存进度**
-
-predict_all()
-read_progress()`"]
-            Single["`**单题处理**
-
-answer_with_retry()
-answer_one()`"]
-            Plan["`**必需事实规划**
-
-plan_queries()`"]
-            Predict --> Single
-            Single --> Plan
-        end
-        subgraph RetrieveQuestions["`**retrieve.py**`"]
-            Recall["`**向量与关键词召回**
-
-retrieve()
-keyword_search()`"]
-            Rerank["`**候选去重与重排**
-
-retrieve()`"]
-            Merge["`**事实融合与原文补充**
-
-retrieve_facts()
-expand_pages()`"]
-            Recall --> Rerank
-            Rerank --> Merge
-        end
-        subgraph RerankerSupport["`**models.py**`"]
-            Reranker["`**获取重排模型**
-
-get_reranker()`"]
-        end
-        subgraph GenerateFinish["`**generate.py**`"]
-            Answer["`**多模态回答**
-
-generate_answer()
-invoke_json()
-table_page_images()
-read_chart()（按需）`"]
-            Format["`**整理答案值与引用**
-
-answer_one()
-normalize_answer_value()`"]
-            Save["`**保存进度与提交文件**
-
-predict_all()`"]
-            Answer --> Format
-            Format --> Save
-        end
-        PredictStart --> GenerateStart
-        Plan --> RetrieveQuestions
-        Reranker -.-> RetrieveQuestions
-        Merge --> GenerateFinish
-    end
-    Store --> RetrieveQuestions
-
-    style BuildEntry fill:#f8fafc,stroke:#94a3b8
-    style IndexDispatch fill:#f8fafc,stroke:#94a3b8
-    style IngestBuild fill:#f8fafc,stroke:#94a3b8
-    style IndexWrite fill:#f8fafc,stroke:#94a3b8
-    style EmbeddingSupport fill:#eef2ff,stroke:#818cf8
-    style PredictEntry fill:#f8fafc,stroke:#94a3b8
-    style GenerateStart fill:#f8fafc,stroke:#94a3b8
-    style RetrieveQuestions fill:#f8fafc,stroke:#94a3b8
-    style RerankerSupport fill:#eef2ff,stroke:#818cf8
-    style GenerateFinish fill:#f8fafc,stroke:#94a3b8
-```
-
-缺少事实时最多补查一轮；图表按需独立读取。预测使用已有索引，原文补充和页面渲染直接读取论文。
-
-### 功能与实现
-
-#### 模型与图片工具
-
-实现文件：[models.py](src/wattbot/models.py)。
-
-| 功能 | 主要函数 | 当前实现 |
-|---|---|---|
-| 文本向量 | `get_embeddings()` | `BAAI/bge-small-en-v1.5`，向量归一化；优先使用图形处理器（GPU），CUDA 不可用时使用中央处理器（CPU） |
-| 候选重排模型 | `get_reranker()` | `BAAI/bge-reranker-base`；优先使用图形处理器（GPU），CUDA 不可用时使用中央处理器（CPU） |
-| 大模型选择 | `get_llm()` | 默认深度求索（DeepSeek）`deepseek-flash`，可选 MiMo `mimo-v2.6-flash`；默认关闭思考 |
-| 原页与图片工具 | `page_image()`、`image_block()` | 按需渲染完整原页并缓存，将图片编码为多模态消息 |
-
-模型客户端、向量模型和重排模型按需加载，在同一进程中复用。
-
-#### 论文解析与证据准备
-
-实现文件：[ingest.py](src/wattbot/ingest.py)。
-
-| 功能 | 主要函数 | 当前实现 |
-|---|---|---|
-| 论文解析 | `get_converter()`、`ingest_pdf()` | Docling 提取正文、表格与图片；默认关闭光学字符识别（OCR） |
-| 正文分块 | `get_chunker()`、`get_text_chunks()` | 按章节和图表边界组织正文，合并同章节短块并控制长度 |
-| 表格与续表处理 | `table_groups()`、`table_search_text()` | 保留列名、单位与行信息，对满足条件的跨页续表归组 |
-| 原图导出 | `save_item_images()` | 导出表格与图片截图，保存来源页码和原图路径 |
-| 图表检索描述 | `describe_picture()`、`describe_pictures()` | 结合图题与相关正文描述图片；异常表格按截图转写，生成检索文字 |
-| 图像筛选与描述复用 | `inspect_picture()`、`describe_pictures()` | 空白图不调用描述模型，精确重复图复用描述，优先使用缓存，未缓存图片并发处理 |
-| 上下文与脚注 | `element_contexts()`、`element_notes()` | 为图表补充章节及相关原文；已识别脚注保留来源并独立入库 |
-| 证据记录封装 | `make_document()` | 将检索文本和原始证据组装成文档对象（Document），保存来源、页码与图片路径 |
-
-#### 索引管理
-
-实现文件：[index.py](src/wattbot/index.py)。
-
-| 功能 | 主要函数 | 当前实现 |
-|---|---|---|
-| 本地持久化索引 | `get_vector_store()` | Chroma 统一索引正文、表格文本和图片描述，保存原始证据元数据 |
-| 按论文更新 | `build_index()` | 解析完成后替换该论文的旧记录，分批写入新记录 |
-
-#### 混合检索
-
-实现文件：[retrieve.py](src/wattbot/retrieve.py)。
-
-| 功能 | 主要函数 | 当前实现 |
-|---|---|---|
-| 向量召回 | `retrieve()` | 根据查询语义检索，常规查询最多召回 60 条候选 |
-| 关键词与短语召回 | `keyword_search()` | 使用全文检索模块（FTS5）与 BM25 排序，常规查询最多召回 60 条候选 |
-| 名称与型号匹配 | `entity_pattern()` | 兼容名称中的空格和连字符，区分型号前缀与版本后缀 |
-| 候选重排与去重 | `retrieve()` | 合并两路候选，使用 BGE 重排，再按证据标识去重 |
-| 多事实证据融合 | `retrieve_facts()` | 使用倒数排名融合（RRF），兼顾各事实覆盖；首轮选取最多 10 份检索证据 |
-| 原文上下文补充 | `expand_pages()` | 补充相关页、论文首页与邻近正文，恢复实验条件等上下文 |
-
-#### 多模态回答与引用
-
-实现文件：[generate.py](src/wattbot/generate.py)。
-
-| 功能 | 主要函数 | 当前实现 |
-|---|---|---|
-| 事实规划与查询改写 | `plan_queries()` | 保留原问题，拆分必需事实，并生成检索改写 |
-| 结构化多模态回答 | `generate_answer()`、`invoke_json()` | 结合原文、表格原页与图片，使用 Pydantic 整理答案值、引用、支持材料和解释 |
-| 表格原页与独立读图 | `table_page_images()`、`read_chart()` | 表格优先附完整原页，必要时逐图读取数值及其条件 |
-| 缺失事实补查 | `answer_one()` | 根据答案草稿最多补查一轮，可在已命中文献内检索 |
-| 无答案处理 | `blank_answer()`、`answer_one()` | 无可用证据或明确拒答时，生成比赛要求的 `is_blank` 字段 |
-| 支持材料与引用来源 | `verify_supports()`、`answer_one()` | 将支持材料关联到证据标识，并从官方元数据生成引用链接 |
-| 答案值格式整理 | `normalize_answer_value()` | 整理真假值与显式数值范围，保留模型给出的数值精度 |
-
-#### 批量运行与评分
-
-主要实现文件：[generate.py](src/wattbot/generate.py)；官方评分文件：[input/Score.py](input/Score.py)。
-
-| 功能 | 主要函数 | 当前实现 |
-|---|---|---|
-| 并发问答 | `generate.predict_all()` | 最多并发处理 3 题，共享的本地检索与重排串行执行 |
-| 断点恢复与重新预测 | `generate.read_progress()` | 恢复问题和单位匹配的成功结果；使用 `--restart` 开始新一轮预测 |
-| 请求与输出异常重试 | `generate.answer_with_retry()`、`generate.invoke_json()` | 内容过滤和结构化输出截断按对应分支重试，相关失败题记录到 `.failed.csv` |
-| 进度保存与结果导出 | `generate.predict_all()` | 逐题写入进度，全部完成后按输入顺序更新提交文件，保留原输入列 |
-| 官方本地评分 | `Score.score()` | 使用比赛提供的答案值、引用 F1 与拒答评分规则；独立于预测流程 |
-
-模块间通过文档对象（Document）、证据字典和答案草稿传递数据：`page_content` 保存检索文本，`metadata` 保存原始证据、来源、页码和图片路径。
-
-## 方案作用
-
-项目将逐篇查找文献、整理证据和填写答案的过程串成可重复运行的流程，用于完成比赛提交，也可通过自定义问题文件查询同一文献集。
-
-比赛要求把答案与指定文献中的证据对应起来。检索提供可追溯的来源，多模态输入帮助读取正文解析无法完整表达的图表信息，结构化输出则将结果转换为比赛需要的字段。
-
-| 比赛需求 | 项目做法与作用 |
-|---|---|
-| 证据分散在正文、表格和图片中 | Docling 保留文档结构；图表通过文本表示参与检索，命中后提供原图，便于读取表头、图例和数值 |
-| 问题同时包含语义描述与精确型号、术语 | 向量检索覆盖语义相近内容，关键词检索补充名称和短语匹配，降低单一召回方式的遗漏风险 |
-| 跨文献问题需要多个事实 | 先规划必需事实，再分别检索并融合证据，使不同操作数或来源都有机会进入回答上下文 |
-| 召回内容多，相关程度不同 | BGE 重排与证据去重集中保留相关材料，减少重复上下文 |
-| 答案需要可核查的引用和解释 | 保存原始证据、页码和来源映射，将支持材料及推理写入提交文件 |
-| 整批预测需要稳定完成 | 本地模型和索引复用，逐题保存进度，支持中断后继续 |
-
-## 运行方法
-
-### 1. 安装环境
-
-需要 Python 3.14 或以上版本和 uv。可用的 NVIDIA 图形处理器（GPU）用于 CUDA 加速；没有可用 CUDA 时自动使用中央处理器（CPU）。以下命令以 Windows PowerShell 为例：
-
-```powershell
-git clone https://github.com/DeianHsu/WattBot.git
-cd WattBot
-uv sync
-.venv\Scripts\Activate.ps1
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-```
-
-最后一条命令显示 PyTorch 版本和 CUDA 可用状态：`True` 时本地向量模型与重排模型使用图形处理器（GPU），`False` 时自动使用中央处理器（CPU），运行速度会较慢。Windows 环境按项目配置安装 CUDA 13.0 版 PyTorch。
-
-`pyproject.toml` 声明项目和依赖范围，`uv.lock` 固定依赖版本；`uv sync` 读取二者并建立项目 `.venv` 环境。
-
-### 2. 配置大模型 API
-
-`.env.example` 提供配置模板，首次使用时复制为项目根目录的 `.env`：
-
-```powershell
-Copy-Item .env.example .env
-```
-
-项目默认使用 DeepSeek，并关闭思考模式。编辑 `.env`，填写 `DEEPSEEK_API_KEY`：
-
-```dotenv
-LLM_PROVIDER=deepseek
-ANSWER_REASONING_EFFORT=off
-MIMO_API_KEY=
-DEEPSEEK_API_KEY=你的密钥
-```
-
-`ANSWER_REASONING_EFFORT=off` 保持关闭思考。使用 MiMo 时，将 `LLM_PROVIDER` 设为 `mimo`，填写 `MIMO_API_KEY`。图片描述、异常表格转写、事实规划和问答会调用所选 API。
-
-`models.py` 读取 `.env` 和环境变量来选择供应商、创建客户端；`generate.py` 读取最终回答的思考模式配置。
-
-### 3. 准备比赛数据与论文
-
-仓库已包含比赛提供的 `input/` 文件，可直接使用。文件来源及更新见 [WattBot 2026 官方数据页面](https://www.kaggle.com/competitions/WattBot2026/data)：
-
-| 文件 | 用途与使用方 |
-|---|---|
-| `metadata.csv` | 提供文献 ID、元数据及固定下载 URL；`generate.py` 用于核对引用 ID 和填入引用链接 |
-| `test_Q.csv` | 提供测试问题和预期答案单位；由 `generate.predict_all()` 默认读取 |
-| `train_QA.csv` | 提供带答案、引用和证据的训练示例；可通过 `--input` 生成预测，或作为本地评分的标准答案 |
-| `Score.py` | 比赛提供的独立评分工具，预测流程不调用它 |
-| `CONTRIBUTE_QUESTIONS.md` | 官方问题贡献说明，供参赛者阅读 |
-| `WRITEUP_TEMPLATE.md` | 官方参赛报告模板，供参赛者填写 |
-
-另行按 `metadata.csv` 的固定 URL 下载论文，保留指定版本，并以 `<id>.pdf` 命名。
-
-`papers/` 中的 PDF 在建库时由 `ingest.py` 解析；预测时，`retrieve.py` 可从中补充页面原文，`models.py` 可按需渲染表格原页。
-
-本地目录示例：
+## 管线
 
 ```text
-WattBot/
-├─ input/
-│  ├─ metadata.csv
-│  ├─ test_Q.csv
-│  ├─ train_QA.csv
-│  ├─ Score.py
-│  ├─ CONTRIBUTE_QUESTIONS.md
-│  └─ WRITEUP_TEMPLATE.md
-├─ papers/
-│  └─ <metadata 中的 id>.pdf
-├─ scripts/
-├─ src/wattbot/
-├─ .env
-├─ pyproject.toml
-└─ uv.lock
+PDF → Docling
+    ├─ 正文 → 同章节合并分块（图表作为边界）
+    ├─ 表格 → 带列名/单位的行级检索文字 + 完整表格/原截图
+    └─ 图片 → 图题/相关正文 + 所选大模型描述 + 原图
+             ↓
+     BGE embedding → Chroma
+             ↓
+     问题 → 所选大模型列出最少必需事实（单事实题保留原问 + 术语改写）
+              ↓
+     每项事实：向量 60 条 + 关键词 60 条 → 重排 → 原始证据
+              ↓
+     各路轮流合并 → 按 evidence_id 去重 → 最多取 10 份原始证据
+             ↓
+     取回原始证据 → 所选大模型 → 提交 CSV
 ```
 
-论文、密钥、索引和生成结果需在本地准备或生成。
+- `ingest.py`：统一解析、分块、保存图片、生成图片描述。
+- `index.py`：按论文建库；重新处理一篇论文时直接替换它的记录。
+- `retrieve.py`：向量、关键词／短语召回与重排，合并证据并补充少量原始页面文字。
+- `generate.py`：事实规划、多模态回答、引用及拒答处理、CSV 输出。
+- `models.py`：共用模型和路径；`get_llm()` 根据配置选择 MiMo 或 DeepSeek。
+- `main.py`：建库、预测入口。
 
-### 4. 建立索引
+检索文本存入 Document 的 page_content，原始正文、完整表格、页码和图片路径直接存在 metadata 中，不再维护独立的 evidence.json。图片文件仍保存在 artifacts 下；长表格的不同检索块会重复存储完整表格内容，以换取更简单的取证逻辑。异常表格的模型转写只用于检索，metadata 明确标记文字解析不可靠，回答仍使用原表截图。
+
+## 使用
+
+在项目根目录执行以下命令。
 
 ```powershell
-# 处理 papers/ 中的全部 PDF
-python scripts/build_index.py
+uv sync
+.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+Windows 的 PyTorch 从官方 CUDA 13.0 索引安装。第二条命令应输出 `True`；embedding 和重排都必须能访问 CUDA，不会自动退回 CPU。模型和向量维度未变，已有 Chroma 索引不需要重建。
+
+在已有 `.env` 中配置模型，格式参考 `.env.example`。保留其他配置，不提交真实密钥。
+
+```dotenv
+# 可选 mimo 或 deepseek；只需填写所选供应商的密钥。
+LLM_PROVIDER=mimo
+MIMO_API_KEY=
+DEEPSEEK_API_KEY=
+```
+
+`mimo` 使用 `mimo-v2.6-flash`；`deepseek` 使用支持图片的 `deepseek-flash`。未设置 `LLM_PROVIDER` 时沿用 MiMo。图片描述、异常表格转写、事实规划、读图与回答统一通过 `get_llm()` 调用；embedding 和重排仍使用本地 BGE 模型。仅切换问答模型时重新启动命令即可，不需要重建索引。
+
+2026-10-02 的通用索引管线改动需要重新处理受影响论文后才会进入 Chroma。现有索引不会随源码变化自动更新；本轮没有重建或删除已有索引。建议先用 `build-index --pdf` 验证少量不同论文，再决定是否全量建库；这一步会写入该论文的索引，也会按需调用图表 API。
+
+```powershell
+# 建立全部论文的索引
+uv run python src/wattbot/main.py build-index
 
 # 只处理一篇论文
-python scripts/build_index.py --pdf "papers/实际论文文件名.pdf"
+uv run python src/wattbot/main.py build-index --pdf "papers/实际论文文件名.pdf"
+
+# 生成提交文件
+uv run python src/wattbot/main.py predict
+
+# 模型或提示词改动后，重新预测全部题目（不重建索引）
+uv run python src/wattbot/main.py predict --restart
+
+# 切换到 DeepSeek 后使用独立输出，保留 MiMo 结果和各自的断点进度
+uv run python src/wattbot/main.py predict --output submissions/test_submission_deepseek.csv
 ```
 
-首次运行会下载所需本地模型。`index.py` 将向量索引写入 `chroma_db/`，供预测阶段打开和检索；`ingest.py` 将截图和描述缓存写入 `artifacts/`，`models.py` 也在该目录缓存按需渲染的原页。问答阶段通过图片工具读取这些文件并附入模型请求。重新处理单篇论文会替换该论文的索引记录。
-
-### 5. 生成并提交答案
+需要比较改动前后的训练题效果时，先生成固定的 40 题开发集，再分别保存预测和评分：
 
 ```powershell
-python scripts/predict.py
+uv run python scripts/make_dev_questions.py
+uv run python src/wattbot/main.py predict --input artifacts/dev_questions.csv --output artifacts/dev_baseline.csv
+uv run python -m wattbot.evaluate input/train_QA.csv artifacts/dev_baseline.csv
 ```
 
-入口调用 `generate.predict_all()`，默认读取 `input/test_Q.csv` 和 `input/metadata.csv`，将结果写入 `submissions/test_submission.csv`，完成后可将该 CSV 提交到 Kaggle。
+开发集只把题目和单位传给模型；标准答案仅用于评分。40 题刻意覆盖少见题型，分数不能直接等同于 Kaggle 公开榜分数。每次改动使用相同输入、不同输出文件对照。
 
-输出保留题号、原问题和预期单位，并填入以下字段：
+也可用 predict 的 --input 和 --output 指定问题文件和输出路径。安装项目后，uv run wattbot 可以调用同一入口。
 
-| 字段 | 内容 |
-|---|---|
-| `answer` | 自然语言回答 |
-| `answer_value` | 标准化数值、类别或 `is_blank` |
-| `ref_id`、`ref_url` | 支持文献 ID 与链接 |
-| `supporting_materials` | 原文引语、表格或图表证据 |
-| `explanation` | 证据如何支持答案，以及必要的计算过程 |
+## 约定与注意事项
 
-### 6. 自定义输入与恢复运行
+- 默认论文位于 papers/，文件名去掉扩展名后即官方 ref_id。
+- 输入为 input/test_Q.csv 和 input/metadata.csv；输出为 submissions/test_submission.csv。
+- 预测最多同时处理 3 题；不同题目的大模型请求可重叠，本地检索与 GPU 重排串行，输出仍按问题文件顺序排列。
+- 每完成一题就追加并刷新同名 `.progress.jsonl` 进度文件；中断后重跑相同命令，跳过已保存且问题、单位未变的题目。旧版未保存的结果无法恢复，旧提交文件不作为缓存。模型、提示词或索引改变后用 `--restart` 重新预测；不同输出路径有独立进度。
+- 内容过滤只重试一次；结构化输出显式使用 8192 token 预算，截断时要求精简 JSON 并用 16384 token 重试一次。持续过滤或截断写入同名 `.failed.csv` 并继续其余题目，不伪造 `is_blank`。全部题目成功后按输入顺序更新最终 CSV；缺题时原提交保持不变，命令退出状态为 1，重跑会补做未完成题目。
+- `--restart` 只用于新一轮的首次启动；该轮中断后续跑时去掉此参数，避免清空已保存的进度。
+- 新版图片描述使用 `.figure-retrieval-v3.txt`，异常表格检索转写使用 `.table-retrieval-v3.txt`。旧 `.txt` 保留且不复用，首次新版建库会重新生成所需描述；修改论文、描述提示词或描述模型后，需要清理对应新版缓存再建库。
+- 首次建库可能下载模型。Docling 正文与表格结构识别在本地运行；图片描述、异常表格的截图转写、问题事实规划及问答会调用所选大模型。正常表格不调用转写 API。
+- MiMo 默认关闭深度思考，模型仍为 `mimo-v2.6-flash`。8 题固定证据对照未出现答案或引用分回退；最低值题仍存在证据覆盖／读图波动，详见 [思考开关对照](reports/thinking_ab_20261002.md)。已有索引和图片描述缓存不需要重建。
+- 模型对象保留缓存，避免每道题重新加载 embedding 或 reranker。
+- 使用 wattbot_multimodal_v2 collection，旧的纯文本 wattbot collection 不变。按论文替换索引时，写入失败可能留下该论文的部分记录，需要重新建这篇论文。
+- 当前仍沿用原有 metadata 字段和 collection，不使用旧 evidence.json。分块、图表描述或解析策略改变后，应更新相应论文的索引；更新前预测仍读取旧表示。
+- 2026-10-02 已完成 317 题全量预测，耗时约 45 分钟（含一次进程退出后的断点恢复）。CSV 行数、题号顺序、单位及引用格式检查通过，失败列表为空。27 题输出 `is_blank`；q204、q453、q463 缺少有效引用和支持材料，答案值已保留。格式检查不代表答案准确率。
+- 用户提供的同日 Kaggle 公榜截图显示分数为 **0.896**，上一版为 0.871，提升 0.025，截图排名第 3。该结果对应整套改动，尚未单独消融各项修改对分数的贡献；公开排名会随其他提交变化。
+- 当前仍是基于图片描述检索的多模态 RAG，尚未加入视觉向量检索。跨论文题按必需事实分别检索；数值条件由所选大模型核对，计算结果与单位换算直接采用模型答案。
 
-```powershell
-# 自定义问题文件和输出位置
-python scripts/predict.py --input input/questions.csv --output submissions/answers.csv
+## 建库耗时与图片处理
 
-# 模型、提示词或索引改变后重新预测
-python scripts/predict.py --restart
-```
+- 建库会打印 Docling 解析、正文/表格处理、图片导出、图片描述和向量写入的阶段耗时。
+- 固定论文集默认关闭 Docling OCR，保留原生 PDF 文字层、版面和表格识别；图片中的文字仍由图片描述模型处理。扫描型 PDF 若没有原生文字层，需要重新开启 OCR。
+- 表结构识别关闭 PDF cell matching，使用结构模型的文字单元格，降低原 PDF 文字框合并行列的风险；这是 [Docling 官方提供的配置](https://docling-project.github.io/docling/usage/advanced_options/)，仍需实际论文验证解析质量。
+- 正文分块按来源引用还原真实元素类型；只合并同章节且总长不超过 400 tokens 的正文，不跨图表边界。表格独立处理，坏表格不会参与正文序列化。
+- 正常表格保留多级列名、单位、完整行、表题及脚注；不同检索块共享相同 evidence_id。仅一行且至少两列出现长列表的表格视为疑似粘连，按截图生成检索转写；该启发式不能证明表格一定错误，也不能覆盖所有解析问题。
+- 未命中新版描述缓存的图片默认最多并发 3 个大模型请求；图片描述 API 或配置的系统级错误仍会中止当前建库。
+- 图片导出与描述仅处理 Docling 标记为正文的图片。描述额外接收章节标题和同页最多两段相关原文，优先选择明确引用该图的段落，排除其他图表的标题；上下文不由模型生成。
+- 模型明确返回装饰图标记时不入库；技术示意图、实验照片和无图题的图表保留。该分类仍可能误判，需要小样检查；图题缺失、尺寸较小或没有坐标轴都不会单独触发过滤。
+- 完全空白图片不调用描述模型；像素、图题和上下文都相同的图片共享一次描述，每个元素仍保留自己的来源和原图映射。新版缓存不命中时最多并发三个图片描述请求。
+- 已有新版缓存会复用；修改论文、描述提示词或模型后，需要清理对应 `.figure-retrieval-v3.txt` / `.table-retrieval-v3.txt` 再建库，旧缓存无需删除。
 
-自定义问题 CSV 需要 `id`、`question` 和 `answer_unit` 字段，文献元数据仍从 `input/metadata.csv` 读取。
+## 局部异常处理
 
-`generate.py` 为每个输出路径保存同名 `.progress.jsonl`，由 `read_progress()` 恢复成功结果。中断后重跑相同命令即可继续；新一轮首次启动使用 `--restart`，续跑时去掉该参数。部分题目失败时，程序保存成功进度并写入 `.failed.csv`；全部题目完成后才更新最终提交文件。
+- 每项查询的向量与关键词召回分别最多 60 条；关键词名额的一半优先保留精确短语。各路轮流取重排证据，按 evidence_id 去重后最多保留 10 份。所有题保留原问题；规划保持实体、数量和各操作数自己的条件，允许用等义技术术语表达指标，在最多四条短查询内补一个必要的术语改写，减少口语措辞漏召回。判断题查中性的定义或核算边界，避免重复命题或扩展成泛化场景。复用 Chroma 的 FTS5 索引，无须重新建库。
+- 每轮最终证据补充三个相关页面及这些论文的首页（每轮最多新增六页），恢复表格行、跨块条件和研究身份；页面有独立来源 ID。首次回答发现必需事实缺失时，最多补查一轮、两个缺失事实；已识别论文的补查复用规划函数，改写为缺失指标与所在配置／章节的两条短查询，不重复模型名。论文内全部块进入重排，保留最多 20 份去重证据及首轮操作数。普通题仍为规划、生成各一次调用；论文内补查多一次短查询改写，多图数值题还会增加读图请求。
+- PDF 部分解析成功时告警并使用可用内容；整篇解析失败或没有任何可入库内容时仍抛错。
+- 元素截图失败或图片缺失时告警，保留可用文字；图片描述为空时回退到图题，没有检索文字则跳过该图。
+- 表格导出失败或疑似行列粘连时保留截图，转写只用于检索；没有截图的异常表格告警后跳过，其他正文继续处理。不拿模型描述或转写冒充原始证据。
+- 结构化分块遇到内容错误时，回退到已提取元素的普通文本分块；此时可能丢失部分结构和上下文，不代表完整解析质量。
+- 引用、supporting_materials、explanation 的局部异常只整理或降级对应字段，保留已有 answer_value；移除无效引用，不补造来源、引文或推理。保留答案不代表已经验证答案正确。
+- 核心答案缺失、明确拒答或整个输出无法解析时才回退为 is_blank；辅助字段问题不会触发整题拒答。系统回退不代表该题客观上不可回答。
+- 评分器将标准答案中的 `[low, high]` 当作单值容忍范围；预测单个数值时应给有证据支持的点值。题目要求两个端点或多个独立数值时用字符串 `(a, b)`，不能将预测的不确定性写成 `[low, high]`。模型偶尔返回的 True/False 会归一化为比赛要求的 1/0。
+- `answer_value` 的类别答案只保留最短完整名称；which device/model 等身份题优先输出证据里的真实名称，不能只写设备泛称。完整句子放在 `answer`；单值题优先使用条件吻合的原文数值，不从更宽的场景区间随意取中点。
+- 每条证据提供 E1/E2 等短标签，由程序还原真实 ID，查询路数只留在内部记录，避免被当作正确性提示。引用从已核验的支持材料推导，优先最小充分来源集合；同一论文的块与整页重复命中时可确定论文归属，跨论文歧义不猜。真实短引文和表格单元格也可核验，数字边界不允许把 25 匹配到 125 或 25.1；PDF 换行拆开的英文单词允许连接。引文允许逐字片段间的脚注省略和尾部标点差异，以 `…` 标明省略；长引文仅错一个 `is/are/of` 连接词时可恢复实际原文。引用中的数字、否定、实体和单位不能改。存在引文不代表它符合题意。
+- 支持记录的内部 `required` 标记由模型区分主证据和重复旁证，提示词要求每个计算操作数均保留主来源；程序核验引用归属后沿用该选择。标记缺失／损坏或全部为旁证时保守保留已核验来源，不改核心答案，不限制引用篇数。
+- 所有题型采用同一管线，正文和表格以带数值、单位及条件的完整原文发送。最终生成只要求 7 个字段，先输出简短 `explanation`，再填写与其最终结果一致的答案，减少解释已纠正但早先答案未更新的问题。不再要求 `numeric_facts`、可执行算式或额外正确性标记。数量识别、条件判断、计算、换算和拒答由模型决定，程序不做答案内容核验或语义改写。
+- 图表数值题核对面板、系列、坐标尺度及统计范围。提供了单位且同论文命中多张候选原图时，逐图隔离读取，最多三张并发；来源由程序绑定，再由所选模型统一回答，已读图片不重复发送。单图读数作为上下文，不覆盖最终答案；图表冲突是否需要拒答也由最终模型决定。读图格式异常回退普通多模态生成。所有调用保留供应商函数的非思考配置。
+- 提交单位同时出现在问题上下文、末尾输出约定和 `answer_value` 字段说明中；换算后的值由模型填写。未要求更高精度的估算倍率／时长提示模型使用三位有效数字，绝对计数／数量保留换算精度；操作数的范围不自动变成答案范围，单值问题仍返回一个有依据的估计。程序不执行换算、计算或舍入。明确范围和误写为 JSON 数组的多值答案只整理格式，辅助字段异常不清空核心答案。
+- 空索引、模型加载、API/鉴权/额度、必需配置及文件读写等系统级错误仍中止；可选描述缓存读写失败只告警。不使用捕获全部异常后继续运行的方式。
+
+离线回归检查：`uv run python -m unittest discover -s tests -v`。测试替换模型、解析器和索引，不调用 API、不下载模型、不改动现有索引；不代表全量论文或答案质量验证。

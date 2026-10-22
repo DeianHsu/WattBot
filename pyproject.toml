@@ -1,8 +1,8 @@
-# 项目依赖与构建配置；建库和预测直接运行 scripts 下的独立脚本。
+# 项目依赖与命令行入口；模型加载和外部请求只在业务命令执行时发生。
 [project]
 name = "wattbot"
 version = "0.1.0"
-description = "基于 Docling、LangChain 和 DeepSeek 的 WattBot 多模态 RAG"
+description = "基于 Docling、LangChain 和 MiMo 的 WattBot 多模态 RAG"
 authors = [
     { name = "DeianHsu", email = "663781679@qq.com" }
 ]
@@ -19,7 +19,6 @@ dependencies = [
     "langchain-text-splitters>=1.1.2",
     "pandas>=3.0.6",
     "pypdf>=6.19.0",
-    "pypdfium2>=5.13.0",
     "python-dotenv>=1.2.3",
     "sentence-transformers>=6.1.0",
     "torch==2.14.0",
@@ -33,6 +32,9 @@ torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+[project.scripts]
+wattbot = "wattbot.main:main"
 
 [build-system]
 requires = ["uv_build>=0.12.2,<0.13.0"]
