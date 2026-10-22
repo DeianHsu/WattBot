@@ -26,27 +26,20 @@ RERANK_K = RETRIEVAL_K + KEYWORD_K
 logger = logging.getLogger(__name__)
 
 
-def _require_cuda(purpose):
-    """本地向量与重排模型需要 CUDA；不可用时立即报错，避免隐式退回 CPU。"""
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            f"{purpose} 需要 CUDA，但当前 PyTorch 无法使用 GPU；"
-            "请运行 uv sync 并检查 torch.cuda.is_available()"
-        )
-
-
-def _chat_client(model, key_name, base_url):
-    """共用客户端构造，只读取当前供应商的密钥。"""
+@lru_cache(maxsize=1)
+def get_mimo():
+    """获取 MiMo 客户端；缓存客户端对象，不缓存问题或答案。"""
     # 在真正需要调用生成模型时读取密钥，避免导入文件就要求配置密钥。
     load_dotenv(ROOT / ".env")
-    api_key = os.getenv(key_name)
+    api_key = os.getenv("MIMO_API_KEY")
     if not api_key:
-        raise RuntimeError(f"请在项目 .env 中设置 {key_name}")
+        raise RuntimeError("请在项目 .env 中设置 MIMO_API_KEY")
 
+    # 图片描述和最终答案共用一个模型；小样对照无答案回退，默认关闭深度思考。
     return ChatOpenAI(
-        model=model,
+        model="mimo-v2.6-flash",
         api_key=api_key,
-        base_url=base_url,
+        base_url="https://api.xiaomimimo.com/v1",
         temperature=0,
         extra_body={"thinking": {"type": "disabled"}},
         timeout=120,
@@ -55,32 +48,45 @@ def _chat_client(model, key_name, base_url):
 
 
 @lru_cache(maxsize=1)
-def get_mimo():
-    """获取 MiMo 客户端；缓存客户端对象，不缓存问题或答案。"""
-    return _chat_client("mimo-v2.6-flash", "MIMO_API_KEY", "https://api.xiaomimimo.com/v1")
-
-
-@lru_cache(maxsize=1)
 def get_deepseek():
     """获取 DeepSeek 多模态客户端；缓存客户端对象，不缓存问题或答案。"""
-    return _chat_client("deepseek-flash", "DEEPSEEK_API_KEY", "https://api.deepseek.com")
+    # 仅在选择 DeepSeek 时读取密钥，不要求同时配置两个供应商。
+    load_dotenv(ROOT / ".env")
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("请在项目 .env 中设置 DEEPSEEK_API_KEY")
+
+    # 图片描述和问答共用原生多模态模型；沿用关闭思考和网络超时设置。
+    return ChatOpenAI(
+        model="deepseek-flash",
+        api_key=api_key,
+        base_url="https://api.deepseek.com",
+        temperature=0,
+        extra_body={"thinking": {"type": "disabled"}},
+        timeout=120,
+        max_retries=2,
+    )
 
 
 def get_llm():
-    """统一选择生成模型；默认使用 DeepSeek。"""
+    """统一选择生成模型；未指定供应商时沿用 MiMo。"""
+    # 先读取配置，客户端缓存由各供应商函数负责。
     load_dotenv(ROOT / ".env")
-    provider = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
-    if provider == "deepseek":
-        return get_deepseek()
+    provider = os.getenv("LLM_PROVIDER", "mimo").strip().lower()
     if provider == "mimo":
         return get_mimo()
-    raise ValueError(f"不支持的 LLM_PROVIDER：{provider}；可选 deepseek 或 mimo")
+    if provider == "deepseek":
+        return get_deepseek()
+    raise ValueError(f"不支持的 LLM_PROVIDER：{provider}；可选 mimo 或 deepseek")
 
 
 @lru_cache(maxsize=1)
 def get_embeddings():
     """加载文本向量模型，用于正文、表格文本、图片描述和问题。"""
-    _require_cuda("Embedding")
+    # 建库和问题检索共用 GPU 向量模型；CUDA 不可用时立即报错，避免隐式退回 CPU。
+    if not torch.cuda.is_available():
+        raise RuntimeError("Embedding 需要 CUDA，但当前 PyTorch 无法使用 GPU；请运行 uv sync 并检查 torch.cuda.is_available()")
+
     # 归一化向量，并在当前进程中复用模型，避免每道题重复加载。
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
@@ -92,7 +98,10 @@ def get_embeddings():
 @lru_cache(maxsize=1)
 def get_reranker():
     """加载文本重排模型；图片通过描述参与重排，而不是直接输入原图。"""
-    _require_cuda("重排")
+    # 没有可用 CUDA 时立即停止，避免整批预测悄悄落回 CPU 跑数小时。
+    if not torch.cuda.is_available():
+        raise RuntimeError("重排需要 CUDA，但当前 PyTorch 无法使用 GPU；请运行 uv sync 并检查 torch.cuda.is_available()")
+
     # 保留全部召回候选的重排结果，最终名额在 evidence_id 去重后截取。
     model = HuggingFaceCrossEncoder(
         model_name="BAAI/bge-reranker-base",

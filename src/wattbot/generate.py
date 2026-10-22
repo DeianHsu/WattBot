@@ -17,18 +17,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from wattbot.index import get_vector_store
 from wattbot.models import ROOT, get_llm, get_reranker, image_block
-from wattbot.retrieve import (
-    expand_pages,
-    expand_referenced_pages,
-    expand_table_pages,
-    retrieve_facts,
-)
-from wattbot.checks import (
-    answer_constraint_violations,
-    audit_numeric_answer,
-    calculate,
-    normalize_categorical_answer,
-)
+from wattbot.retrieve import expand_pages, retrieve_facts
 
 
 logger = logging.getLogger(__name__)
@@ -85,12 +74,6 @@ class ChartReadings(BaseModel):
     readings: list[NumericFact] = Field(default_factory=list)
 
 
-class FormattedAnswer(BaseModel):
-    """显式格式约束不满足时，只做抽取式缩短的结果。"""
-
-    answer_value: str = Field(description="A shorter answer using only words from the current answer.")
-
-
 class EvidenceQuery(BaseModel):
     """证据缺失时补查一个明确事实，可限定已识别的原始论文。"""
 
@@ -111,10 +94,6 @@ class AnswerDraft(BaseModel):
     supports: list[EvidenceSupport] = Field(default_factory=list)
     missing_queries: list[EvidenceQuery] = Field(default_factory=list)
     answer: str = ""
-    calculation: str = Field(default="", description=(
-        "Optional Python arithmetic expression with numeric literals only; "
-        "no variables, units or prose. Use for a required multi-step calculation."
-    ))
     answer_value: str | int | float = Field(description=(
         "Only the requested value: a number without units, the minimal complete "
         "name/category, 1/0 for true/false, a required '(a, b)' string, or 'is_blank'. "
@@ -420,40 +399,6 @@ def blank_answer(reason):
     }
 
 
-def rewrite_answer_value(question, answer_value, unit, limit):
-    """只在题目显式词数超限时，要求模型从当前答案中抽取更短的完整术语。"""
-    prompt = (
-        "Shorten the current answer to satisfy the question's explicit word limit. "
-        "Use ONLY words from the current answer; preserve entities, model versions, "
-        "units and necessary qualifiers. If it still exceeds the limit, remove optional "
-        "modifiers (adjectives/descriptors) first; never remove the head noun. "
-        "Do not add facts, numbers, sources or explanations. "
-        "Return one JSON object matching the schema.\nJSON Schema:\n"
-        + json.dumps(FormattedAnswer.model_json_schema(), ensure_ascii=False)
-    )
-    content = (
-        f"Question: {question}\nCurrent answer: {answer_value}\n"
-        f"Expected unit: {unit or 'not specified'}\n"
-        f"Required: at most {limit} words."
-    )
-    try:
-        formatted = invoke_json(
-            FormattedAnswer,
-            [SystemMessage(content=prompt), HumanMessage(content=content)],
-        )
-    except (OutputParserException, ValidationError):
-        logger.warning("约束重写失败，保留原答案：%s", answer_value)
-        return None
-    candidate = formatted.answer_value.strip()
-    old_words = {word.lower().strip(".,;:") for word in answer_value.split()}
-    new_words = [word for word in candidate.split() if word.strip(".,;:")]
-    if (candidate and len(new_words) <= limit
-            and {word.lower().strip(".,;:") for word in new_words} <= old_words):
-        return candidate
-    logger.warning("约束重写未满足抽取或词数限制，保留原答案：%s -> %s", answer_value, candidate)
-    return None
-
-
 def normalize_answer_value(value, question=""):
     """整理真假值和明确的范围／多值格式，保留答案本身。"""
     # 严格数值范围可无损改成集合；型号连字符、负数和千位逗号保持原样。
@@ -469,78 +414,90 @@ def normalize_answer_value(value, question=""):
     return {"true": "1", "false": "0"}.get(text.lower(), text)
 
 
-def _normalize_quote(text):
-    """统一大小写、空白和引号；保留同行连字符，只有内容侧可去换行连字符。"""
-    text = text.translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'}))
-    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
-
-
-def _contains(haystack, needle):
-    """文本逐字包含；纯数字使用边界，避免把 25 匹配到 125、25.1 或 25e3。"""
-    if not needle:
-        return False
-    if re.fullmatch(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[+-]?\d+)?", needle):
-        return re.search(
-            rf"(?<![\d.,+-]){re.escape(needle)}(?!\d|[.,]\d|[eE][+-]?\d)", haystack
-        ) is not None
-    return needle in haystack
-
-
-def _quote_matches(quote, content):
-    """逐字匹配完整引文；省略号/脚注分段按顺序匹配，不做模糊改写。"""
-    needle = _normalize_quote(quote).strip(".,;:")
-    haystack = _normalize_quote(content)
-    if _contains(haystack, needle):
-        return True
-
-    # PDF 只在换行处拆开复合词时才允许去连字符；同行连字符保持严格匹配。
-    if re.search(r"[A-Za-z]-\s*\n", content):
-        unwrapped_quote = _normalize_quote(re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", "", quote))
-        content_clean = re.sub(r"(?<=[A-Za-z])-\s*\n\s*(?=[a-z])", "", content)
-        content_clean = re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", "", content_clean)
-        if _contains(_normalize_quote(content_clean), unwrapped_quote.strip(".,;:")):
-            return True
-
-    # 脚注编号、省略号或换行把引文拆成多段时，各段必须按原顺序出现。
-    number = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[+-]?\d+)?"
-    parts = [part.strip(" .,;:") for part in re.split(
-        r"\s*(?:\.{3}|…|(?<=[.!?])\s+|\n+)\s*", quote
-    ) if len(_normalize_quote(part)) >= 3 or re.fullmatch(number, _normalize_quote(part))]
-    if len(parts) > 1:
-        offset = 0
-        for part in parts:
-            norm = _normalize_quote(part).strip(".,;:")
-            if re.fullmatch(number, norm):
-                hit = re.search(
-                    rf"(?<![\d.,+-]){re.escape(norm)}(?!\d|[.,]\d|[eE][+-]?\d)",
-                    haystack[offset:],
-                )
-                position = offset + hit.start() if hit else -1
-            else:
-                position = haystack.find(norm, offset)
-            if position < 0:
-                return False
-            offset = position + len(norm)
-        return True
-    return False
-
-
 def verify_supports(draft, evidence):
-    """核对支持材料是否逐字存在于给定来源，并整理引用；不改答案值。"""
+    """核对引文归属并整理模型选定的必需证明，不判断答案内容。"""
+    def normalize(text):
+        """容忍 PDF 空格及 Unicode 字形差异，保留标点和数字。"""
+        # 只连接换行拆开的英文单词；数字、同行连字符和否定词均不删除。
+        text = re.sub(r"\b([A-Za-z]{2,})-\s*\n\s*([a-z]{2,})\b", r"\1\2", text)
+        text = text.translate(str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"'}))
+        return "".join(unicodedata.normalize("NFKC", text).split()).casefold()
+
+    def match_quote(quote, content):
+        """允许明确省略的逐字片段，禁止模糊改写或删除不匹配的数字。"""
+        # 复合词的连字符恰好落在换行处时，按该原文恢复连接；同行连字符不放宽。
+        for word in re.findall(r"\b[A-Za-z]{2,}-[a-z]{2,}\b", quote):
+            left, right = word.split("-")
+            if re.search(rf"\b{re.escape(left)}-\s*\n\s*{re.escape(right)}\b", content, re.I):
+                quote = quote.replace(word, left + right)
+        # 末尾逗号／句号和 PDF 脚注间隔不会使整篇真实来源消失。
+        needle, original = normalize(quote).rstrip(".,;:"), normalize(content)
+        # 短单元格或数值引文也可绑定真实来源；边界防止把 25 匹配到 125 或 25.1。
+        number = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:e[+-]?\d+)?"
+        numeric = bool(re.fullmatch(number, needle))
+        prefix = r"[\d.,+-]" if numeric else r"\w"
+        suffix = r"\d|[.,]\d|[eE][+-]?\d" if numeric else r"\w"
+        short_pattern = r"\s*".join(re.escape(part) for part in
+                                    unicodedata.normalize("NFKC", quote.rstrip(".,;:")).split())
+        if needle and (len(needle) >= 20 and needle in original or re.search(
+                rf"(?<!{prefix}){short_pattern}(?!{suffix})",
+                unicodedata.normalize("NFKC", content), re.I)):
+            return quote.rstrip(".,;:")
+        # 长引文只错一个连接词时，恢复完整原文；数字、否定、实体和单位不能改。
+        if len(needle) >= 100:
+            linkers = {"is", "are", "of"}
+            parts = re.split(r"(\s+|\b(?:is|are|of)\b)", quote.rstrip(".,;:"), flags=re.I)
+            pattern = "".join(r"\s*" if part.isspace() else
+                              r"\b(?:is|are|of)\b" if part.lower() in linkers else re.escape(part)
+                              for part in parts)
+            # 引用输出采用匹配到的原始文本，避免把修正后的模型句子当原文。
+            candidate = re.search(pattern, content, re.I)
+            if candidate:
+                actual = candidate.group()
+                words = lambda text: re.findall(r"\w+|[^\w\s]", text.casefold())
+                left, right = words(quote.rstrip(".,;:")), words(actual)
+                if len(left) == len(right) and sum(a != b for a, b in zip(left, right)) == 1:
+                    return actual
+        parts = re.split(r"\s*(?:\.{3}|…|\n+|(?<=[.!?])\s+)\s*", quote)
+        matched, offset = [], 0
+        for part in parts:
+            segment = normalize(part).rstrip(".,;:")
+            position = original.find(segment, offset) if len(segment) >= 20 else -1
+            # 明确省略号中的短表格数值也逐字核对，保留符号、小数、科学计数及顺序。
+            if re.search(r"\.{3}|…", quote) and re.fullmatch(number, segment):
+                pattern = rf"(?<![\d.,+-]){re.escape(segment)}(?!\d|[.,]\d|[eE][+-]?\d)"
+                hit = re.compile(pattern).search(original, offset)
+                position = hit.start() if hit else -1
+            if position >= 0:
+                matched.append(part.rstrip(".,;:"))
+                offset = position + len(segment)
+        recovered = " … ".join(matched)
+        numbers = r"[+-]?\d+(?:\.\d+)?"
+        # 表头被模型整理过时仍保留完整的逐字数据行；每个引用数字必须可核验。
+        rows = sum(bool(re.match(r"^\d+(?:\s+\d+(?:\.\d+)?%?){3,}", part.strip())) for part in parts)
+        coverage = .5 if rows >= 2 else .7
+        if len(normalize(recovered)) >= max(20, len(needle) * coverage) and re.findall(numbers, recovered) == re.findall(numbers, quote):
+            return recovered
+        return ""
+
     records = {record["evidence_id"]: record for record in evidence}
     verified = []
     for support in draft.get("supports", []):
         source = support["evidence_id"]
         record = records.get(source)
         quote = support["quote"].strip()
+        # 引文逐字匹配当前提供的原始正文/表格，唯一匹配时修正模型错挂的来源。
         if quote:
-            matched = [item for item in evidence if _quote_matches(quote, item["content"])]
-            if record is None or not _quote_matches(quote, record["content"]):
-                owners = {item["ref_id"] for item in matched}
-                record = matched[0] if len(owners) == 1 and matched else None
+            matches = {item["evidence_id"]: text for item in evidence
+                       if (text := match_quote(quote, item["content"]))}
+            if source not in matches:
+                # 同一论文的块与整页可能重复命中；论文归属唯一即可，不跨论文猜来源。
+                owners = {records[key]["ref_id"] for key in matches}
+                record = records[next(iter(matches))] if len(owners) == 1 else None
             if record is None:
-                logger.warning("支持引文无法绑定唯一来源，跳过该条，不改 answer_value")
+                logger.warning("支持引文无法唯一绑定原文，跳过该条，不改 answer_value")
                 continue
+            quote = matches[record["evidence_id"]]
         elif not (record and record.get("image_paths") and support["visual_detail"].strip()):
             logger.warning("支持材料缺少可核验的原文或图像，跳过该条")
             continue
@@ -550,11 +507,13 @@ def verify_supports(draft, evidence):
                          support.get("required", True)))
         support["evidence_id"] = record["evidence_id"]
 
+    # 未给核验记录时保持既有降级；明确给出但全被否定的材料不再当作有效引用。
     if not verified:
         if draft.get("supports"):
             draft["ref_ids"] = []
             draft["supporting_materials"] = "is_blank"
         return draft
+    # 沿用模型的主证据选择；全部被标为旁证时保守保留已核验来源。
     selected = [(record, text) for record, text, required in verified if required]
     if not selected:
         logger.warning("缺少必需证明标记，保留已核验来源")
@@ -607,13 +566,14 @@ def generate_answer(question: str, answer_unit: str, evidence, facts=None, visua
     # 保留缺少单位时的既有规则，不把无单位的分类题误判为不可回答。
     answer_unit = answer_unit or ""
     read_sources = {reading["evidence_id"] for reading in visual_readings or []}
-    # 有单位时，对所有明确的图表原图做独立读数；单图题也读取，避免只靠最终模型混合读图。
+    # 有单位且同论文命中多张图时直接隔离读取，省去一轮混合多图的初始答案。
     if visual_readings is None and answer_unit.strip().lower() not in ("", "is_blank"):
-        charts = [record for record in evidence
-                  if record["modality"] == "image" and record["image_paths"]
-                  and not (re.match(r"\s*table\b", str(record.get("content") or ""), re.I)
-                           and not re.search(r"\b(?:fig(?:ure)?|chart|plot)\b",
-                                            str(record.get("content") or ""), re.I))][:2]
+        counts = {}
+        for record in evidence:
+            if record["modality"] == "image" and record["image_paths"]:
+                counts[record["ref_id"]] = counts.get(record["ref_id"], 0) + 1
+        charts = [record for record in evidence if record["modality"] == "image"
+                  and record["image_paths"] and counts.get(record["ref_id"], 0) > 1]
         if charts:
             with ThreadPoolExecutor(max_workers=3) as pool:
                 groups = list(pool.map(partial(read_chart, question, answer_unit,
@@ -639,10 +599,8 @@ def generate_answer(question: str, answer_unit: str, evidence, facts=None, visua
         content.append({"type": "text", "text": (
             "Independent per-image readings with program-bound source IDs follow. "
             "They were obtained from actual images; these already-read images "
-            "they already-read images are not reattached. Use the readings as visual evidence. "
-            "Use them to check panel, scale and scope. If the source text already states the "
-            "requested quantity exactly in the requested unit, prefer that text value; use an "
-            "approximate chart reading only when the text does not state it. Reconcile all matching "
+            "are not reattached. Use the readings as visual evidence. "
+            "Use them to check panel, scale and scope. Reconcile all matching "
             "readings against explicit original source wording. If incompatible "
             "matching totals cannot be reconciled, abstain and explain the conflict.\n"
             + json.dumps(visual_readings, ensure_ascii=False)
@@ -696,10 +654,6 @@ def generate_answer(question: str, answer_unit: str, evidence, facts=None, visua
         "in answer_value. For a calculation, use the question's exact baseline "
         "and ALL requested inputs; a single component is not a combined total. "
         "Match each input's own metric and scope, and cite every operand's source. "
-        "When the answer requires arithmetic, put a numeric-only Python expression "
-        "in calculation and the same final result in answer_value. "
-        "For table evidence, use its actual row labels, column headers and units; "
-        "do not collapse a table into a single prose sentence. "
         "Write the concise explanation before the final answer fields; copy its "
         "FINAL converted result into answer and answer_value. Keep quotes verbatim "
         "and include adjacent scope restrictions."
@@ -736,9 +690,7 @@ def answer_one(row, metadata_by_id):
     with RETRIEVAL_LOCK:
         evidence = retrieve_facts(facts)
     if evidence:
-        evidence = expand_referenced_pages(expand_pages(evidence, row["question"]), row["question"])
-        if row.get("answer_unit", "").strip().lower() not in ("", "is_blank"):
-            evidence = expand_table_pages(evidence, row["question"])
+        evidence = expand_pages(evidence, row["question"])
         draft = generate_answer(row["question"], row.get("answer_unit", ""), evidence, facts)
         # 只补查一轮缺失事实；论文限定必须来自本题实际证据，避免虚构来源。
         known_refs = {record["ref_id"] for record in evidence}
@@ -751,13 +703,7 @@ def answer_one(row, metadata_by_id):
                 extra.extend(retrieve_facts(queries, [lookup["ref_id"]] if lookup["ref_id"] else None))
         if extra:
             # 优先补查证据，并保留首轮已取得的操作数；不再次进入补查循环。
-            evidence = expand_referenced_pages(
-                expand_pages(list({item["evidence_id"]: item for item in [*extra, *evidence]}.values()),
-                             row["question"]),
-                row["question"],
-            )
-            if row.get("answer_unit", "").strip().lower() not in ("", "is_blank"):
-                evidence = expand_table_pages(evidence, row["question"])
+            evidence = expand_pages(list({item["evidence_id"]: item for item in [*extra, *evidence]}.values()), row["question"])
             draft = generate_answer(row["question"], row.get("answer_unit", ""), evidence, facts)
     else:
         logger.warning("%s 没有可用检索证据，回退为 is_blank", row["id"])
@@ -772,52 +718,6 @@ def answer_one(row, metadata_by_id):
     if set(draft["ref_ids"]) - set(ref_ids):
         logger.warning("%s 已移除未检索到或缺少元数据网址的引用", row["id"])
     answer_value = normalize_answer_value(draft["answer_value"], row["question"])
-    # 无单位类别题按题目词数限制/末尾从句收短；实体名和数值不受影响。
-    if row.get("answer_unit", "").strip().lower() in ("", "is_blank"):
-        shortened = normalize_categorical_answer(answer_value, row["question"])
-        if shortened:
-            logger.warning("%s 类别答案收短：%s -> %s", row["id"], answer_value, shortened)
-            answer_value = shortened
-    violations = answer_constraint_violations(
-        answer_value, row["question"], row.get("answer_unit", "")
-    )
-    word_limit = next((int(reason.split(":")[1]) for reason in violations
-                       if reason.startswith("word_limit:")), None)
-    if word_limit:
-        rewritten = rewrite_answer_value(
-            row["question"], answer_value, row.get("answer_unit", ""), word_limit
-        )
-        if rewritten:
-            logger.warning("%s 约束重写：%s -> %s", row["id"], answer_value, rewritten)
-            answer_value = rewritten
-    # 解释中明确可复核的最终算式/百分比与字段不一致时，采用可复核值。
-    audited = audit_numeric_answer(
-        row["question"], answer_value, draft["explanation"], row.get("answer_unit", "")
-    )
-    if audited and audited != answer_value:
-        logger.warning("%s 数值审计修正：%s -> %s", row["id"], answer_value, audited)
-        answer_value = audited
-    # 程序化计算：只接受数字字面量表达式，避免模型心算误差。
-    calculation = (draft.get("calculation") or "").strip()
-    directly_reported = bool(re.search(
-        rf"(?<![\d.,]){re.escape(answer_value)}(?![\d.,])", draft.get("explanation", "")
-    ))
-    if calculation and not directly_reported and row.get("answer_unit", "").strip().lower() not in ("", "is_blank"):
-        computed = calculate(calculation)
-        try:
-            current = float(answer_value)
-        except (TypeError, ValueError):
-            current = None
-        if computed is not None and current is not None:
-            if abs(computed - current) > max(abs(current) * 0.005, 1e-3):
-                candidate = (str(int(round(computed)))
-                             if abs(computed - round(computed)) < 1e-9
-                             else format(computed, ".15g"))
-                logger.warning("%s 程序化计算修正：%s -> %s (%s)",
-                               row["id"], answer_value, candidate, calculation)
-                answer_value = candidate
-        elif computed is not None and answer_value.lower() == "is_blank":
-            logger.warning("%s 程序化计算得到数值但模型拒答，保留拒答", row["id"])
     is_blank = not answer_value or answer_value.lower() == "is_blank"
 
     # 只有核心答案缺失或明确拒答时才清空整题，不因辅助字段缺陷改写答案值。

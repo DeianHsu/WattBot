@@ -82,9 +82,9 @@ class PipelineTests(unittest.TestCase):
         client.assert_not_called()
 
     def test_llm_routes_only_to_selected_provider(self):
-        """默认使用 DeepSeek；切换供应商时只构造对应客户端。"""
+        """默认使用 MiMo；切换供应商时只构造对应客户端。"""
         # 模拟未配置、显式选择和大小写输入，不读取真实密钥。
-        for provider, selected in ((None, "deepseek"), ("mimo", "mimo"), (" DEEPSEEK ", "deepseek")):
+        for provider, selected in ((None, "mimo"), ("mimo", "mimo"), (" DEEPSEEK ", "deepseek")):
             with self.subTest(provider=provider), patch.object(models, "load_dotenv") as load, \
                  patch.object(models.os, "getenv", side_effect=lambda name, default=None: default if provider is None else provider), \
                  patch.object(models, "get_mimo") as mimo, patch.object(models, "get_deepseek") as deepseek:
@@ -311,7 +311,7 @@ class PipelineTests(unittest.TestCase):
     def test_reranker_requires_cuda(self):
         """CUDA 不可用时明确失败，不隐式退回 CPU。"""
         with patch.object(models.torch.cuda, "is_available", return_value=False):
-            with self.assertRaisesRegex(RuntimeError, "重排\\s*需要 CUDA"):
+            with self.assertRaisesRegex(RuntimeError, "重排需要 CUDA"):
                 models.get_reranker.__wrapped__()
 
     def test_bad_record_skipped_and_short_result_allowed(self):
@@ -441,7 +441,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(row["answer_value"], "1249")
         self.assertEqual(row["explanation"], "Model calculation.")
         self.assertNotIn("numeric_facts", draft)
-        self.assertIn("calculation", draft)
+        self.assertNotIn("calculation", draft)
 
     def test_calculation_preserves_model_precision(self):
         """倍率、估算时长和计数的精度全部由模型输出决定。"""
@@ -456,7 +456,7 @@ class PipelineTests(unittest.TestCase):
             explanation="700000000 * 0.42 / 1000 * 0.18 = 52920 liters.",
             calculation="v1 * v2 * v3").model_dump()
         self.assertEqual(draft["answer_value"], "52920")
-        self.assertIn("calculation", draft)
+        self.assertNotIn("calculation", draft)
 
     def test_numeric_condition_flag_does_not_override_final_answer(self):
         """旧的数值条件标记不触发程序拒答，最终核心答案保持原样。"""
@@ -504,16 +504,15 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(generate.normalize_answer_value(value, question), value)
 
     def test_retired_audit_fields_are_absent_from_schema(self):
-        """精简 schema 只保留核心答案和可选的程序化计算字段。"""
+        """精简 schema 不要求数值抽取、可执行算式或额外正确性标记。"""
         properties = generate.AnswerDraft.model_json_schema()["properties"]
         self.assertEqual(next(iter(properties)), "explanation")
-        for field in ("numeric_facts", "visual_readings",
+        for field in ("numeric_facts", "calculation", "visual_readings",
                       "unresolved_conflict", "selection_reason"):
             self.assertNotIn(field, properties)
         parser = PydanticOutputParser(pydantic_object=generate.AnswerDraft)
         draft = parser.parse('{"answer_value": 42, "numeric_facts": [{"value": 1}], "calculation": "v1 / 0"}')
         self.assertEqual(draft.answer_value, 42)
-        self.assertEqual(draft.calculation, "v1 / 0")
 
     def test_model_visual_abstention_is_preserved(self):
         """图表证据冲突时，模型明确给出的拒答及其原因继续保留。"""
@@ -712,6 +711,22 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(result["ref_ids"], [])
             self.assertEqual(result["answer_value"], 42)
 
+    def test_long_quote_repairs_only_one_linker_using_original_text(self):
+        """长引文连接词误抄可恢复原文，数字、否定、实体及多处改写仍被拒绝。"""
+        content = ("Across all ten tasks, we observe a considerable variation in measured energy use, "
+                   "from classification requiring 0.003 kWh to image generation, whose mean consumption is 3.2kWh.")
+        evidence = [{"evidence_id": "text", "ref_id": "paper", "pages": [1], "content": content, "image_paths": []}]
+        quote = content.replace("consumption is", "consumption of")
+        draft = generate.AnswerDraft(answer_value=3.2, supports=[{"evidence_id": "text", "quote": quote}]).model_dump()
+        result = generate.verify_supports(draft, evidence)
+        self.assertEqual(result["ref_ids"], ["paper"])
+        self.assertIn(content.rstrip("."), result["supporting_materials"])
+        for bad in (quote.replace("3.2", "3.8"), quote.replace("image generation", "text generation"),
+                    quote.replace("consumption of", "consumption is not"), quote.replace("variation in", "variation of")):
+            with self.subTest(quote=bad), self.assertLogs(generate.logger):
+                draft = generate.AnswerDraft(answer_value=3.2, supports=[{"evidence_id": "text", "quote": bad}]).model_dump()
+                self.assertEqual(generate.verify_supports(draft, evidence)["ref_ids"], [])
+
     def test_table_ellipsis_retains_exact_short_numeric_fragments(self):
         """省略号间的短数值必须保留原始顺序、千位逗号和小数边界。"""
         content = "| Energy Consumption (MWh) | 85.7 | 232 | 24.1 | 1,287 |"
@@ -740,6 +755,19 @@ class PipelineTests(unittest.TestCase):
             with self.subTest(content=content), self.assertLogs(generate.logger):
                 draft = generate.AnswerDraft(answer_value=1, supports=[{"evidence_id": "page", "quote": quote}]).model_dump()
                 self.assertEqual(generate.verify_supports(draft, [{**record, "content": content}])["ref_ids"], [])
+
+    def test_table_quote_recovers_exact_rows_without_invented_header(self):
+        """重排过表头的引用仍可用逐字原始行核验，输出省略标记而非伪引文。"""
+        caption = "Table 2: Throughput for the different training stages."
+        rows = "16 2 1 96 192 2304 162 51.90%\n51 4 2 24 192 2304 160 51.30%\n101 4 4 12 192 2160 165 52.88%"
+        content = f"{caption}\nParams Tensor Pipeline Data Number Batch Rate FLOPs\n(billion) Parallel Size Size of GPUs Utilization\n{rows}"
+        quote = f"{caption}\nParams (billion) Tensor Parallel Size Pipeline Size Data Size Number of GPUs Batch Rate FLOPs Utilization\n{rows}"
+        record = {"evidence_id": "page", "ref_id": "paper", "pages": [3], "content": content, "image_paths": []}
+        draft = generate.AnswerDraft(answer_value=52.88, supports=[{"evidence_id": "page", "quote": quote}]).model_dump()
+        result = generate.verify_supports(draft, [record])
+        self.assertEqual(result["ref_ids"], ["paper"])
+        self.assertIn("101 4 4 12 192 2160 165 52.88%", result["supporting_materials"])
+        self.assertIn(" … ", result["supporting_materials"])
 
     def test_visual_condition_flags_do_not_override_final_answer(self):
         """旧的图表条件和冲突标记不触发程序拒答，也不进入新 schema。"""
@@ -990,10 +1018,21 @@ class PipelineTests(unittest.TestCase):
         self.assertIn(visual, draft["supporting_materials"])
         self.assertIn("figure OR table images", generate.SYSTEM_PROMPT)
 
+    def test_picture_description_reuses_exact_duplicates(self):
+        """精确重复图片只生成一次描述，但返回每个图片元素的结果。"""
+        jobs = [
+            (SimpleNamespace(), ["first.png"], "same caption", "same context"),
+            (SimpleNamespace(), ["second.png"], "same caption", "same context"),
+            (SimpleNamespace(), ["third.png"], "other caption", "other context"),
+        ]
+        with patch.object(ingest, "inspect_picture", side_effect=[((1, "same"), False), ((1, "same"), False), ((2, "other"), False)]), patch.object(ingest, "read_description_cache", return_value=None), patch.object(ingest, "describe_picture", side_effect=["same description", "other description"]):
+            descriptions = ingest.describe_pictures(jobs, "paper")
+        self.assertEqual(descriptions, ["same description", "same description", "other description"])
+
     def test_blank_picture_skips_remote_description(self):
         """完全空白图片只保留图题，不调用远程描述。"""
         jobs = [(SimpleNamespace(), ["blank.png"], "blank caption", "")]
-        with patch.object(ingest, "inspect_picture", return_value=True), patch.object(ingest, "describe_picture") as describe:
+        with patch.object(ingest, "inspect_picture", return_value=((1, "blank"), True)), patch.object(ingest, "describe_picture") as describe:
             self.assertEqual(ingest.describe_pictures(jobs, "paper"), ["blank caption"])
             describe.assert_not_called()
 
